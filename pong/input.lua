@@ -72,17 +72,10 @@ end
 -- Опрос ввода
 --------------------------------------------------------------------------------
 
---- Подсчёт доступных байт на stdin (POSIX). Возвращает nil, если метод недоступен.
-local function availBytes()
-    local ok, ffi = pcall(require, "ffi")
-    if not ok then return nil end
-    local okRes, res = pcall(function()
-        ffi.cdef[[ int read(int fd, void *buf, unsigned long count); ]]
-        -- FIONREAD через ioctl слишком платформозависим; проще: неблокирующий read 1 байта
-        return true
-    end)
-    return nil
-end
+--- Неблокирующее чтение всех доступных байт stdin (POSIX + LuaJIT poll).
+-- ВАЖНО: cdef объявляем ровно один раз на весь процесс — повторный ffi.cdef
+-- с той же структурой/сигнатурой в LuaJIT бросает "redefinition" ошибку.
+local pollCdefDone = false
 
 --- Неблокирующее чтение всех доступных байт stdin (POSIX + LuaJIT poll).
 local function posixPoll(ffi)
@@ -115,16 +108,18 @@ function M.poll(timeoutMs)
             -- poll() доступен только в настоящей tty; в pipe его лучше не использовать
             local isTty = savedStty ~= nil and #savedStty > 0
             if isTty then
-                local okInit = pcall(function()
-                    ffi.cdef[[
-                        struct pollfd { int fd; short events; short revents; };
-                        int poll(struct pollfd *fds, unsigned long nfds, int timeout);
-                    ]]
-                end)
-                if okInit then
-                    local ok, keys = pcall(posixPoll, ffi)
-                    if ok then return M.normalize(keys) end
+                if not pollCdefDone then
+                    local okInit = pcall(function()
+                        ffi.cdef[[
+                            struct pollfd { int fd; short events; short revents; };
+                            int poll(struct pollfd *fds, unsigned long nfds, int timeout);
+                        ]]
+                    end)
+                    if not okInit then return M.normalize({}) end
+                    pollCdefDone = true
                 end
+                local ok, keys = pcall(posixPoll, ffi)
+                if ok then return M.normalize(keys) end
             end
         end
     end

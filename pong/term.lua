@@ -161,6 +161,8 @@ end
 local RESET = ESC .. "[0m"
 
 function M.present()
+    if not buf then return end   -- защита от вызова до init(): раньше падало с
+                                 -- «attempt to index a nil value (upvalue 'buf')»
     local out = {}
     local n = 0
     local curY = 1 -- логическая позиция курсора (1-based)

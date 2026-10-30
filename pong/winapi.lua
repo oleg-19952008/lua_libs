@@ -82,15 +82,27 @@ local inputRecordSize = ffi.sizeof("INPUT_RECORD_KB")
 local STD_INPUT_HANDLE  = -10
 local STD_OUTPUT_HANDLE = -11
 
+-- Корректная проверка валидности HANDLE:
+--   * ffi.NULL   — NULL-хэндл (GetStdHandle возвращает его, когда консоль недоступна);
+--     раньше сравнивали cdata с nil ("h == nil") — это не детектировало NULL и молча
+--     пропускало вызовы kernel32 с невалидным хэндлом;
+--   * INVALID_HANDLE (-1) — явный признак ошибки.
+local function validHandle(h)
+    if h == nil then return false end          -- на всякий случай (не cdata)
+    if h == ffi.NULL then return false end
+    if h == INVALID_HANDLE then return false end
+    return true
+end
+
 local function outHandle()
-    local h = ffi.C.GetStdHandle(STD_OUTPUT_HANDLE)
-    if h == nil or h == INVALID_HANDLE then return nil end
+    local ok, h = pcall(ffi.C.GetStdHandle, STD_OUTPUT_HANDLE)
+    if not ok or not validHandle(h) then return nil end
     return h
 end
 
 local function inHandle()
-    local h = ffi.C.GetStdHandle(STD_INPUT_HANDLE)
-    if h == nil or h == INVALID_HANDLE then return nil end
+    local ok, h = pcall(ffi.C.GetStdHandle, STD_INPUT_HANDLE)
+    if not ok or not validHandle(h) then return nil end
     return h
 end
 

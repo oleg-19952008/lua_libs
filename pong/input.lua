@@ -1,96 +1,138 @@
 -- input.lua
 -- Неблокирующий ввод с клавиатуры для терминальной игры.
--- Windows: через runBat-механизм paths.lua было бы слишком медленно,
--- поэтому используем io.read("l") в отдельном потоке (luathreading) — но его может не быть.
--- Универсальный вариант: читаем по одному символу через os.clock + pcall(io.read).
--- Для POSIX используем stty raw mode; для Windows — io.read() без буфера (работает в cmd).
+-- Windows (LuaJIT): Console API через winapi.lua (ReadConsoleInputA) —
+--   работает и в pipe, и в настоящей консоли, реагирует на нажатие без Enter.
+-- POSIX (LuaJIT): stty raw + poll() на stdin.
+-- Фолбэк (Lua 5.1.4 без ffi): блокирующее чтение строк через io.read.
 
 local M = {}
 
 local IS_WINDOWS = package.config:sub(1, 1) == "\\"
-local queue = {}
-local savedStty = nil
 
---- Включить режим "по нажатию" (без Enter).
+local function script_dir()
+    local src = debug.getinfo(1, "S").source
+    if src:sub(1, 1) == "@" then src = src:sub(2) end
+    return src:match("(.*[/\\])") or "./"
+end
+
+local okWinApi, winapi = pcall(function()
+    return loadfile(script_dir() .. "winapi.lua")()
+end)
+if not okWinApi then winapi = nil end
+
+local queue = {}          -- очередь «удерживаемых» клавиш для фолбэк-режима
+local savedStty = nil
+local useWinApi = false
+local useLjPosix = false
+
+--------------------------------------------------------------------------------
+-- Raw-режим
+--------------------------------------------------------------------------------
+
 function M.enableRawMode()
     if IS_WINDOWS then
-        -- В Windows console.io.read блокирует до Enter, если не использовать
-        -- специальные хаки. Пробуем chcp/консольные флаги через ffi при наличии LuaJIT.
-        local ok = pcall(function()
-            local ffi = require("ffi")
-            ffi.cdef[[
-                typedef void* HANDLE;
-                HANDLE GetStdHandle(int n);
-                int SetConsoleMode(HANDLE h, int mode);
-                int GetConsoleMode(HANDLE h, int *mode);
-            ]]
-            local handle = ffi.C.GetStdHandle(-11) -- STD_INPUT_HANDLE
-            local mode = ffi.new("int[1]")
-            ffi.C.GetConsoleMode(handle, mode)
-            -- ENABLE_PROCESSED_INPUT (0x1) only: отключаем line input
-            ffi.C.SetConsoleMode(handle, 0x1)
-        end)
-        return ok
+        if winapi and winapi.available() then
+            local ok = winapi.enableRawMode()
+            if ok then
+                useWinApi = true
+                winapi.wideCP()
+                return true
+            end
+        end
+        return false
     else
-        -- Сохраняем текущие настройки и ставим raw
         local f = io.popen("stty -g 2>/dev/null")
         if f then
             savedStty = f:read("*a")
             f:close()
         end
         os.execute("stty raw -echo 2>/dev/null")
+        local okLJ, ffi = pcall(require, "ffi")
+        useLjPosix = okLJ and ffi ~= nil
         return true
     end
 end
 
---- Вернуть терминал в исходное состояние.
 function M.disableRawMode()
-    if not IS_WINDOWS and savedStty and #savedStty > 0 then
-        os.execute("stty " .. savedStty:gsub("[^%w%-=%s]", "") .. " 2>/dev/null")
-    elseif not IS_WINDOWS then
-        os.execute("stty cooked echo 2>/dev/null")
+    if IS_WINDOWS then
+        if useWinApi then
+            winapi.disableRawMode()
+            useWinApi = false
+        end
+    else
+        if savedStty and #savedStty > 0 then
+            os.execute("stty " .. savedStty:gsub("[^%w%-=%s]", "") .. " 2>/dev/null")
+        else
+            os.execute("stty cooked echo 2>/dev/null")
+        end
     end
 end
 
---- Опросить ввод: возвращает таблицу нажатых клавиш с прошлого вызова.
--- Поддерживаются: w s a d q space arrows (как escape-секвенсии -> up/down/left/right).
-function M.poll()
+--------------------------------------------------------------------------------
+-- Опрос ввода
+--------------------------------------------------------------------------------
+
+--- Подсчёт доступных байт на stdin (POSIX). Возвращает nil, если метод недоступен.
+local function availBytes()
+    local ok, ffi = pcall(require, "ffi")
+    if not ok then return nil end
+    local okRes, res = pcall(function()
+        ffi.cdef[[ int read(int fd, void *buf, unsigned long count); ]]
+        -- FIONREAD через ioctl слишком платформозависим; проще: неблокирующий read 1 байта
+        return true
+    end)
+    return nil
+end
+
+--- Неблокирующее чтение всех доступных байт stdin (POSIX + LuaJIT poll).
+local function posixPoll(ffi)
+    local pfd = ffi.new("struct pollfd[1]")
+    pfd[0].fd = 0
+    pfd[0].events = 1 -- POLLIN
     local keys = {}
-    -- Читаем сколько есть неблокирующе. io.read не поддерживает select на stdin
-    -- переносимо, поэтому читаем один символ, если он доступен.
-    -- На POSIX можно проверить через popen("read -t 0"), но это дорого.
-    -- Компромисс: io.read(0) возвращает "" если данных нет (Lua 5.2+ на не-tty),
-    -- на tty блокируется. Используем обходной путь: read со sleep-таймером невозможна.
-    -- Поэтому для игры используем короткий blocking read: читаем 1 байт с таймаутом
-    -- через os.time — не работает переносимо.
-    --
-    -- Практичное решение: читаем сразу все доступные байты через debug.gethook? Нет.
-    -- Оставляем простой подход: неблокирующий peek только на LuaJIT+POSIX через poll().
-    local okLJ, ffi = pcall(require, "ffi")
-    if okLJ and not IS_WINDOWS then
-        local okp = pcall(function()
-            ffi.cdef[[
-                int poll(struct pollfd *fds, unsigned long nfds, int timeout);
-                struct pollfd { int fd; short events; short revents; };
-            ]]
-            local pfd = ffi.new("struct pollfd[1]")
-            pfd[0].fd = 0
-            pfd[0].events = 1 -- POLLIN
-            while true do
-                local r = ffi.C.poll(pfd, 1, 0)
-                if r <= 0 then break end
-                local ch = io.read(1)
-                if not ch or ch == "" then break end
-                table.insert(keys, ch)
+    while true do
+        local r = ffi.C.poll(pfd, 1, 0)
+        if r <= 0 then break end
+        local ch = io.read(1)
+        if not ch or ch == "" then break end
+        table.insert(keys, ch)
+    end
+    return keys
+end
+
+--- Неблокирующий опрос: возвращает таблицу «нажатых» клавиш за последний интервал.
+-- timeoutMs — сколько ждать при отсутствии событий (Windows Console API).
+function M.poll(timeoutMs)
+    if IS_WINDOWS and useWinApi then
+        local keys = winapi.pollKeys(timeoutMs or 0)
+        if keys then return keys end
+        return {}
+    end
+
+    if not IS_WINDOWS then
+        local okLJ, ffi = pcall(require, "ffi")
+        if okLJ and useLjPosix then
+            -- poll() доступен только в настоящей tty; в pipe его лучше не использовать
+            local isTty = savedStty ~= nil and #savedStty > 0
+            if isTty then
+                local okInit = pcall(function()
+                    ffi.cdef[[
+                        struct pollfd { int fd; short events; short revents; };
+                        int poll(struct pollfd *fds, unsigned long nfds, int timeout);
+                    ]]
+                end)
+                if okInit then
+                    local ok, keys = pcall(posixPoll, ffi)
+                    if ok then return M.normalize(keys) end
+                end
             end
-        end)
-        if okp then
-            return M.normalize(keys)
         end
     end
-    -- Фолбэк: читаем строку целиком (блокирующе до Enter). Игра будет реагировать
-    -- на Enter-подтверждённые команды — приемлемо для демо.
+
+    -- Фолбэк без raw-режима: читаем строку целиком (блокирующе до Enter),
+    -- символы строки считаем «удерживаемыми» до следующей строки.
     local line = io.read("*l")
+    local keys = {}
     if line then
         for i = 1, #line do
             table.insert(keys, line:sub(i, i))
@@ -99,7 +141,10 @@ function M.poll()
     return M.normalize(keys)
 end
 
---- Превратить сырые байты в имена клавиш.
+--------------------------------------------------------------------------------
+-- Нормализация сырых байт в имена клавиш (для POSIX-потока)
+--------------------------------------------------------------------------------
+
 function M.normalize(bytes)
     local out = {}
     local i = 1
@@ -123,5 +168,7 @@ function M.normalize(bytes)
     end
     return out
 end
+
+M.winapi = winapi
 
 return M

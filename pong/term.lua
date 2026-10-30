@@ -1,14 +1,16 @@
 -- term.lua
--- Терминальная графика для игры Pong: двойной буфер RGB + вывод через ANSI TrueColor.
--- Использует color.lua (генерация SGR-кодов) и paths.lua (поиск библиотек).
--- Совместимо с Lua 5.1–5.4 / LuaJIT, Windows и POSIX.
+-- Терминальная графика для игры Pong: RGB-буфер + вывод ANSI TrueColor.
+-- Использует color.lua (генерация SGR-кодов) и font.lua (битмап-шрифт 5x7).
+-- Рендер оптимизирован: пиксели одной строки с одинаковым цветом сливаются
+-- в один escape-запуск, неизменённые строки перемещаются курсором без вывода.
+-- Совместимо с Lua 5.1+ / LuaJIT, Windows и POSIX.
 
 local M = {}
 
 local ESC = string.char(27)
 
 --------------------------------------------------------------------------------
--- Загрузка библиотек репозитория (../color.lua, ../paths.lua, ../random.lua)
+-- Загрузка библиотек репозитория (../color.lua) и соседних модулей
 --------------------------------------------------------------------------------
 
 local function script_dir()
@@ -21,23 +23,24 @@ local sep = package.config:sub(1, 1)
 local root = script_dir() .. ".." .. sep
 
 local function load_lib(name)
-    -- Сначала пробуем require (вдруг пути уже настроены)
     local ok, mod = pcall(require, name)
     if ok and type(mod) == "table" then return mod end
-    -- Иначе грузим по абсолютному пути через paths.joinPath, если возможно
-    local path = root .. name .. ".lua"
-    local chunk, err = loadfile(path)
+    local chunk, err = loadfile(root .. name .. ".lua")
     if not chunk then error("Не удалось загрузить " .. name .. ": " .. tostring(err)) end
     return chunk()
 end
 
-local color  = load_lib("color")
-local paths  = load_lib("paths")
-local random = load_lib("random")
+local function load_local(name)
+    local chunk, err = loadfile(script_dir() .. name .. ".lua")
+    if not chunk then error("Не удалось загрузить " .. name .. ": " .. tostring(err)) end
+    return chunk()
+end
 
-M.color  = color
-M.paths  = paths
-M.random = random
+local color = load_lib("color")
+local font  = load_local("font")
+
+M.color = color
+M.font  = font
 
 --------------------------------------------------------------------------------
 -- Размер поля
@@ -63,20 +66,36 @@ M.COL = {
 }
 
 --------------------------------------------------------------------------------
--- Двойной буфер
+-- Буфер кадров
 --------------------------------------------------------------------------------
 
-local buf = nil
-local textLayer = {}
+local buf = nil          -- buf[y][x] = "idx" в палитре строк (см. ниже)
+local lastBuf = nil      -- предыдущий отправленный кадр для diff-рендера
+
+-- Кэш SGR-строк вида "\27[48;2;r;g;b;38;2;255;255;255m" по ключу r*65536+g*256+b
+local sgrCache = {}
+
+local function sgrFor(r, g, b)
+    local key = r * 65536 + g * 256 + b
+    local s = sgrCache[key]
+    if not s then
+        s = ESC .. "[" .. color.bgRGB(r, g, b) .. ";" .. color.fgRGB(255, 255, 255) .. "m"
+        sgrCache[key] = s
+    end
+    return s
+end
 
 function M.init()
     buf = {}
+    lastBuf = {}
     for y = 1, M.HEIGHT do
-        local row = {}
+        local row, lrow = {}, {}
         for x = 1, M.WIDTH do
             row[x] = {0, 0, 0}
+            lrow[x] = nil
         end
         buf[y] = row
+        lastBuf[y] = lrow
     end
     io.write(ESC .. "[?1049h")  -- alternate screen
     io.write(ESC .. "[?25l")    -- спрятать курсор
@@ -84,7 +103,7 @@ function M.init()
 end
 
 function M.shutdown()
-    io.write(ESC .. "[0m")
+    io.write(ESC .. "[0m\r\n")
     io.write(ESC .. "[?25h")
     io.write(ESC .. "[?1049l")
     io.flush()
@@ -108,61 +127,101 @@ function M.setPixel(x, y, c)
 end
 
 function M.fillRect(x1, y1, x2, y2, c)
-    for y = math.max(1, y1), math.min(M.HEIGHT, y2) do
+    x1 = math.max(1, math.floor(x1)); x2 = math.min(M.WIDTH, math.floor(x2))
+    y1 = math.max(1, math.floor(y1)); y2 = math.min(M.HEIGHT, math.floor(y2))
+    for y = y1, y2 do
         local row = buf[y]
-        for x = math.max(1, x1), math.min(M.WIDTH, x2) do
+        for x = x1, x2 do
             local px = row[x]
             px[1] = c[1]; px[2] = c[2]; px[3] = c[3]
         end
     end
 end
 
---- Рисует ASCII-текст поверх буфера (каждый символ — пиксель цвета c).
--- Для простоты поддерживается только ASCII; кириллица выводится как блоки.
+--- Рисует текст битмап-шрифтом 5x7 поверх буфера (белые «пиксели» букв).
+-- text — ASCII; кириллица отображается как пропуск (шрифт латиницы).
 function M.drawText(x, y, text, c)
-    for i = 1, #text do
-        M.setPixel(x + i - 1, y, c)
-        -- сам символ будет нарисован в present() из текстового слоя
-        textLayer[y] = textLayer[y] or {}
-        textLayer[y][x + i - 1] = text:sub(i, i)
+    local function put(px_x, px_y, r, g, b)
+        if px_x < 1 or px_x > M.WIDTH or px_y < 1 or px_y > M.HEIGHT then return end
+        local px = buf[px_y][px_x]
+        px[1] = r; px[2] = g; px[3] = b
     end
+    font.draw(put, math.floor(x), math.floor(y), text, c)
 end
 
-function M.resetTextLayer()
-    for y = 1, M.HEIGHT do textLayer[y] = nil end
+--- Отцентрировать текст по горизонтали; вернуть стартовую X.
+function M.centerX(text)
+    return math.floor((M.WIDTH - font.width(text)) / 2)
 end
 
 --------------------------------------------------------------------------------
--- Вывод кадра
+-- Вывод кадра (diff + run-length)
 --------------------------------------------------------------------------------
 
--- Кэш последней строки, чтобы не пересылать неизменённые строки
-local lastLines = {}
+local RESET = ESC .. "[0m"
 
 function M.present()
-    M.resetTextLayer()  -- подготавливаем на следующий кадр
-    io.write(ESC .. "[H")
     local out = {}
+    local n = 0
+    local curY = 1 -- логическая позиция курсора (1-based)
     for y = 1, M.HEIGHT do
         local row = buf[y]
-        local tl = textLayer[y] or {}
-        local parts = {}
-        local lineStr = ""
+        local lrow = lastBuf[y]
+
+        -- Проверка: строка целиком совпадает с прошлым кадром?
+        local same = true
         for x = 1, M.WIDTH do
             local px = row[x]
-            local ch = tl[x]
-            if not ch then ch = " " end
-            local code = color.bgRGB(px[1], px[2], px[3])
-            -- fg оставляем чёрным, чтобы пробелы выглядели фоном
-            parts[#parts + 1] = ESC .. "[" .. code .. ";30m" .. ch
-            lineStr = lineStr .. code .. "|" .. ch
+            local lp = lrow[x]
+            if not lp or lp[1] ~= px[1] or lp[2] ~= px[2] or lp[3] ~= px[3] then
+                same = false; break
+            end
         end
-        parts[#parts + 1] = ESC .. "[0m"
-        -- Если строка не изменилась — всё равно печатаем (проще, чем позиционирование)
-        table.insert(out, table.concat(parts))
-        lastLines[y] = lineStr
+        if same then
+            if y ~= curY then
+                n = n + 1; out[n] = ESC .. "[" .. y .. ";1H"
+                curY = y
+            end
+            n = n + 1; out[n] = "\r\n"
+            curY = curY + 1
+        else
+            if y ~= curY then
+                n = n + 1; out[n] = ESC .. "[" .. y .. ";1H"
+                curY = y
+            end
+            local line = {}
+            local ln = 0
+            local prevKey = nil
+            local runLen = 0
+            local flushRun
+            local function appendRun(key, cnt)
+                ln = ln + 1
+                line[ln] = sgrFor(math.floor(key / 65536),
+                                  math.floor(key / 256) % 256,
+                                  key % 256) .. string.rep(" ", cnt)
+            end
+            for x = 1, M.WIDTH do
+                local px = row[x]
+                local key = px[1] * 65536 + px[2] * 256 + px[3]
+                if key == prevKey then
+                    runLen = runLen + 1
+                else
+                    if prevKey then appendRun(prevKey, runLen) end
+                    prevKey = key
+                    runLen = 1
+                end
+                -- обновляем снимок последней строки
+                local lp = lrow[x]
+                if lp then lp[1] = px[1]; lp[2] = px[2]; lp[3] = px[3]
+                else lrow[x] = {px[1], px[2], px[3]} end
+            end
+            if prevKey then appendRun(prevKey, runLen) end
+            ln = ln + 1; line[ln] = RESET
+            n = n + 1; out[n] = table.concat(line) .. "\r\n"
+            curY = curY + 1
+        end
     end
-    io.write(table.concat(out, "\r\n"))
+    io.write(table.concat(out))
     io.flush()
 end
 

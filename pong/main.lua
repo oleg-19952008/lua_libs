@@ -1,11 +1,11 @@
 -- main.lua
 -- Точка входа игры Pong.
--- Собирает вместе библиотеки репозитория:
---   color.lua  — ANSI-коды (через term.lua)
---   paths.lua  — работа с путями (загрузка библиотек, проверка файлов)
---   random.lua — инициализация ГСЧ (seed + случайное направление мяча)
---   base64.lua — сохранение рекордов в файл (кодирование строки результата)
--- Запуск:  lua main.lua
+-- Библиотеки репозитория:
+--   color.lua  — ANSI-коды TrueColor (через term.lua) + финальный текст
+--   paths.lua  — joinPath для файла рекордов
+--   random.lua — initRandom() (seed) + getRandomBytes() (случайная подача)
+--   base64.lua — кодирование строки результата в score.dat
+-- Запуск:  lua main.lua   (рекомендуется luajit — полноценный неблокирующий ввод)
 
 local scriptDir = (debug.getinfo(1, "S").source:gsub("^@", "")):match("(.*[/\\])") or "./"
 local sep = package.config:sub(1, 1)
@@ -30,13 +30,12 @@ local game  = dofile(scriptDir .. "game.lua")
 local input = dofile(scriptDir .. "input.lua")
 
 --------------------------------------------------------------------------------
--- Рекорды (сохраняются в score.dat рядом со скриптом, код base64.lua)
+-- Рекорды (score.dat рядом со скриптом, строки закодированы base64.lua)
 --------------------------------------------------------------------------------
 
 local SCORE_FILE = paths.joinPath(scriptDir, "score.dat")
 
 local function rand01()
-    -- Случайное число [0,1) на основе random.getRandomBytes
     local b = random.getRandomBytes(3)
     if #b < 3 then return math.random() end
     local n = string.byte(b, 1) * 65536 + string.byte(b, 2) * 256 + string.byte(b, 3)
@@ -55,7 +54,7 @@ local function saveScore(scoreL, scoreR, won)
 end
 
 --------------------------------------------------------------------------------
--- Отрисовка кадра
+-- Отрисовка кадра (весь текст — битмап-шрифтом 5x7 из font.lua)
 --------------------------------------------------------------------------------
 
 local function render(s)
@@ -79,23 +78,25 @@ local function render(s)
     term.drawBall(math.floor(s.ballX), math.floor(s.ballY), term.COL.ball)
 
     -- Счёт крупно
-    local scoreStr = string.format("%d                    %d", s.scoreL, s.scoreR)
-    term.drawText(math.floor(c.width / 2) - 10, 2, scoreStr, term.COL.score)
+    local scoreStr = string.format("%d : %d", s.scoreL, s.scoreR)
+    term.drawText(term.centerX(scoreStr), 3, scoreStr, term.COL.score)
 
-    -- Подсказки / сообщения
+    -- Сообщения
+    local midY = math.floor(c.height / 2)
     if s.state == "menu" then
-        term.drawText(math.floor(c.width / 2) - 14, math.floor(c.height / 2) - 3,
-            "T E R M I N A L   P O N G", term.COL.ball)
-        term.drawText(math.floor(c.width / 2) - 18, math.floor(c.height / 2),
-            "press SPACE to start  |  q - quit", term.COL.hud)
-        term.drawText(math.floor(c.width / 2) - 18, math.floor(c.height / 2) + 2,
-            "W/S or Up/Down - move paddle", term.COL.hud)
+        term.drawText(term.centerX("TERMINAL PONG"), midY - 5, "TERMINAL PONG", term.COL.ball)
+        term.drawText(term.centerX("press SPACE to start"), midY + 1, "press SPACE to start", term.COL.hud)
+        term.drawText(term.centerX("W/S or Up/Down - paddle"), midY + 3, "W/S or Up/Down - paddle", term.COL.hud)
+        term.drawText(term.centerX("q - quit"), midY + 5, "q - quit", term.COL.hud)
     elseif s.state == "pause" then
-        term.drawText(math.floor(c.width / 2) - 3, math.floor(c.height / 2),
-            "PAUSE", term.COL.msg)
+        term.drawText(term.centerX("PAUSE"), midY, "PAUSE", term.COL.msg)
+    elseif s.state == "over" then
+        local res = s.scoreL > s.scoreR and "YOU WIN!" or "YOU LOSE"
+        term.drawText(term.centerX(res), midY - 2, res,
+            s.scoreL > s.scoreR and term.COL.score or term.COL.msg)
+        term.drawText(term.centerX("SPACE - again | q - quit"), midY + 2, "SPACE - again | q - quit", term.COL.hud)
     elseif s.msg ~= "" then
-        term.drawText(math.floor(c.width / 2) - math.floor(#s.msg / 2), c.height - 1,
-            s.msg, term.COL.msg)
+        term.drawText(term.centerX(s.msg), c.height - 3, s.msg, term.COL.msg)
     end
 
     term.present()
@@ -105,48 +106,42 @@ end
 -- Главный цикл
 --------------------------------------------------------------------------------
 
+local FPS = 30
+
 local function sleep(sec)
-    -- Переносимый сон: LuaJIT+ffi, иначе busy-wait по os.clock
-    local okLJ, ffi = pcall(require, "ffi")
-    if okLJ then
-        local done = false
-        pcall(function()
-            ffi.cdef[[ void usleep(unsigned int usec); ]]
-            ffi.C.usleep(math.floor(sec * 1000000))
-            done = true
-        end)
-        if done then return end
-    end
+    local ms = math.floor(sec * 1000)
+    if ms <= 0 then return end
+    -- Windows+LuaJIT: kernel32 Sleep; иначе busy-wait по os.clock
+    if input.winapi and input.winapi.sleep(ms) then return end
     local t0 = os.clock()
     while os.clock() - t0 < sec do end
 end
-
-local FPS = 30
 
 local function run()
     random.initRandom()  -- сидируем ГСЧ через random.lua
 
     local s = game.newState()
-    local keysHeld = {}  -- состояние "удерживаемых" клавиш
+    local keysHeld = {}
 
     local rawModeOK = input.enableRawMode()
     term.init()
 
     local running = true
-    local last = os.clock()
+    local frameMs = math.floor(1000 / FPS)
 
     while running do
-        -- Ввод
-        local pressed = input.poll()
+        -- Ввод: на Windows через Console API poll ждёт до конца кадра (не крутит CPU);
+        -- на POSIX фрейм ограничивается сном после рендера.
+        local waitMs = 0
+        if rawModeOK and sep == "\\" then waitMs = frameMs end
+        local pressed = input.poll(waitMs)
+
         for _, k in ipairs(pressed) do
             if k == "q" then
                 running = false
             elseif k == "space" then
-                if s.state == "menu" then
-                    s.state = "play"
-                    game.resetBall(s, rand01() < 0.5 and 1 or -1, rand01)
-                elseif s.state == "over" then
-                    s = game.newState()
+                if s.state == "menu" or s.state == "over" then
+                    if s.state == "over" then s = game.newState() end
                     s.state = "play"
                     game.resetBall(s, rand01() < 0.5 and 1 or -1, rand01)
                 elseif s.state == "pause" then
@@ -160,18 +155,15 @@ local function run()
                 keysHeld[k] = true
             end
         end
-        -- Отпускаем клавиши при каждой новой пачке событий ввода;
-        -- для сырых потоков это грубая, но рабочая эвристика.
-        if #pressed > 0 then
-            for _, k in ipairs(pressed) do
-                -- если клавиша не пришла повторно в следующем poll, она "отпущена"
-            end
-        end
-        -- Для режима строки (фолбэк) каждая poll-строка заменяет набор удерживаемых клавиш
-        if #pressed > 0 then
+
+        -- В Console-API режиме удержание = «клавиша приходила в этом кадре или прошлом»
+        if rawModeOK and sep == "\\" then
             local fresh = {}
             for _, k in ipairs(pressed) do fresh[k] = true end
-            keysHeld = fresh
+            for k in pairs(keysHeld) do
+                if not fresh[k] then keysHeld[k] = nil end
+            end
+            for k in pairs(fresh) do keysHeld[k] = true end
         end
 
         -- Логика
@@ -181,8 +173,7 @@ local function run()
             game.handleRound(s, os.clock())
         end
 
-        -- В режиме строкового фолбэка (нет raw-режима) сбрасываем "удерживаемые"
-        -- клавиши после кадра, чтобы движение не стало бесконечным.
+        -- В строковом фолбэке (нет raw-режима) сбрасываем удержание после кадра
         if not rawModeOK then keysHeld = {} end
 
         if s.state == "over" and not s.saved then
@@ -190,13 +181,12 @@ local function run()
             saveScore(s.scoreL, s.scoreR, s.scoreL > s.scoreR)
         end
 
-        -- Рендер с ограничением FPS
         render(s)
-        local dt = os.clock() - last
-        if dt < 1 / FPS then
-            sleep(1 / FPS - dt)
+
+        -- Ограничение FPS на POSIX (на Windows сон уже учтён в poll)
+        if sep ~= "\\" then
+            sleep(1 / FPS)
         end
-        last = os.clock()
     end
 
     term.shutdown()
@@ -207,10 +197,6 @@ local function run()
 end
 
 -- Защита терминала от аварийного выхода
-local okOld = pcall(function()
-    if type(unpack) == "function" then end -- noop для 5.1
-end)
-
 local rawRun = run
 run = function()
     local ok, err = pcall(rawRun)

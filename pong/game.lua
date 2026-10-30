@@ -43,6 +43,7 @@ function M.newState(cfg)
         msg = "",
         frame = 0,
         randFn = nil,     -- источник случайности (0..1); иначе math.random
+        lastNow = 0,      -- «часы» последнего кадра; обновляет main.lua перед update/handleRound
     }
     return s
 end
@@ -98,12 +99,45 @@ function M.update(s, keys)
 
     -- Мяч: шаг разбивается на подобластные подшаги (substepping), чтобы быстрый
     -- мяч не «туннелировал» сквозь ракетку/стенку за один кадр.
+    -- ВАЖНО (исправление аудита): число подшагов считаем от ОСТАТОЧНОЙ дистанции
+    -- до ближайшей границы по каждой оси, а не от полной скорости. Старая формула
+    -- при |vy| >= height-1 давала nsub = floor(|vy|)+1 и sy ≈ ±1 — ровно период
+    -- зеркала; целочисленные y залипали в цикле «отскок→возврат» и мяч никогда
+    -- не долетал до ворот («невидимый гол», вечный раунд).
     local lx = c.paddleX_L
     local rx = c.width - lx - 1  -- правая ракетка симметрично, ширина 2
 
-    local distY = math.abs(s.vy) + c.ballH
+    local yTop, yBot = 1, c.height - c.ballH + 1
+    -- Границы ворот: мяч «пропущен», когда полностью за полем:
+    --   левые ворота: ballX + ballW < 1  =>  ballX < 1 - ballW
+    --   правые ворота: ballX > width     =>  пересечение на ballX = width + 1
+    local xGoalL, xGoalR = 1 - c.ballW, c.width + 1
+
+    -- Оставшаяся дистанция до ближайшей границы по каждой оси (не до полной
+    -- скорости!) — иначе при |v| >= H-1 подшаг равнялся бы ровно периоду
+    -- зеркального отражения и целочисленный y залипал бы («невидимый гол»):
+    -- мяч никогда не долетал до ворот и раунд не завершался.
+    local remY
+    if s.vy > 0 then
+        remY = yBot - s.ballY
+    elseif s.vy < 0 then
+        remY = s.ballY - yTop
+    else
+        remY = 0
+    end
+    if remY < 0 then remY = 0 end
+    local remX
+    if s.vx > 0 then
+        remX = xGoalR - s.ballX
+    elseif s.vx < 0 then
+        remX = s.ballX - xGoalL
+    else
+        remX = 0
+    end
+    if remX < 0 then remX = 0 end
+
     local maxStep = 1.0
-    local nsub = math.floor(math.max(math.abs(s.vx) + c.ballW, distY) / maxStep) + 1
+    local nsub = math.floor(math.max(remY, remX) / maxStep) + 1
     if nsub < 1 then nsub = 1 end
     local sx = s.vx / nsub
     local sy = s.vy / nsub
@@ -173,17 +207,21 @@ function M.update(s, keys)
 end
 
 --- Обработка событий раунда/паузы вне физики.
--- now — os.time()/os.clock() для таймера между розыгрышами; если не передан,
--- берётся os.clock() (иначе вызов падал с «arithmetic on a nil value»).
+-- now — «часы» вызывающего (main.lua передаёт os.clock()); если не передан,
+-- берётся s.lastNow (его обновляет main.lua каждый кадр), и лишь затем os.clock().
+-- ВАЖНО: handleRound НЕ должен сбрасывать roundUntil при внешнем переходе
+-- round->play (SPACE из меню-подобных состояний) — иначе старые «зависшие»
+-- часы roundUntil будут мгновенно ре-сервисить раунд в вечном цикле.
 function M.handleRound(s, now)
     if s.state ~= "round" then return end
-    if now == nil then now = os.clock() end
+    if now == nil then now = s.lastNow or os.clock() end
     if not s.roundUntil then
         s.roundUntil = now + 1.2
     end
     if now >= s.roundUntil then
         s.roundUntil = nil
         local dir = (s.scoreL + s.scoreR) % 2 == 0 and 1 or -1
+        -- подача использует тот же детерминированный randFn, что и resetBall выше
         M.resetBall(s, dir)
         s.state = "play"
         s.msg = ""

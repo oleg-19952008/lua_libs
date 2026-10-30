@@ -42,16 +42,21 @@ function M.newState(cfg)
         state = "menu",   -- menu | play | pause | round | over
         msg = "",
         frame = 0,
+        randFn = nil,     -- источник случайности (0..1); иначе math.random
     }
     return s
 end
 
---- Сброс мяча в центр; dir = +1 (направо) или -1 (налево); speedMul для вариативности.
+--- Сброс мяча в центр; dir = +1 (направо) или -1 (налево).
+-- randFn — источник угла подачи (0..1); если передан, запоминается в s.randFn,
+-- чтобы handleRound использовал тот же детерминированный поток без math.random.
 function M.resetBall(s, dir, randFn)
     local c = s.cfg
     s.ballX = math.floor(c.width / 2)
     s.ballY = math.floor(c.height / 2)
-    local angle = ((randFn and randFn() or math.random()) * 2 - 1) * 0.35
+    if randFn then s.randFn = randFn end
+    local src = s.randFn or math.random
+    local angle = (src() * 2 - 1) * 0.35
     s.vx = dir * c.ballSpeed0
     s.vy = angle * c.ballSpeed0
 end
@@ -107,14 +112,14 @@ function M.update(s, keys)
         s.ballX = s.ballX + sx
         s.ballY = s.ballY + sy
 
-        -- Отскок от верх/низ (симметричная обработка туннеля: если за подшаг
-        -- мяч пролетел поле по высоте больше чем на 2*maxStep — считаем двойное
-        -- отражение и продолжаем движение вниз; иначе — одинарное).
-        if s.ballY < 1 then
-            s.ballY = 1
-            s.vy = -s.vy; sy = -sy
-        elseif s.ballY + c.ballH - 1 > c.height then
-            s.ballY = c.height - c.ballH + 1
+        -- Отскок от верх/низ. Нормализация «зеркальным» отображением по модулю
+        -- периода 2*(H-1): корректно обрабатывает и двойное прохождение поля
+        -- за подшаг (сверхбыстрый мяч), чего не делал однократный clamp.
+        local period = 2 * (c.height - c.ballH)
+        if s.ballY < 1 or s.ballY > c.height - c.ballH + 1 then
+            local y = (s.ballY - 1) % period          -- [0, period)
+            if y > period / 2 then y = period - y end -- зеркальная половина
+            s.ballY = 1 + y
             s.vy = -s.vy; sy = -sy
         end
 

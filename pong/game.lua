@@ -97,26 +97,43 @@ function M.update(s, keys)
         s.rightY = clamp(s.rightY + step, 1, c.height - c.paddleH)
     end
 
-    -- Мяч: шаг разбивается на подобластные подшаги (substepping), чтобы быстрый
-    -- мяч не «туннелировал» сквозь ракетку/стенку за один кадр.
-    -- ВАЖНО (исправление аудита): число подшагов считаем от ОСТАТОЧНОЙ дистанции
-    -- до ближайшей границы по каждой оси, а не от полной скорости. Старая формула
-    -- при |vy| >= height-1 давала nsub = floor(|vy|)+1 и sy ≈ ±1 — ровно период
-    -- зеркала; целочисленные y залипали в цикле «отскок→возврат» и мяч никогда
-    -- не долетал до ворот («невидимый гол», вечный раунд).
+    -- Мяч: шаг разбивается на подшаги (substepping), чтобы быстрый мяч не
+    -- «туннелировал» сквозь ракетку/стенку за один кадр.
+    -- ВАЖНО №1 (аудит): число подшагов считаем от ОСТАТОЧНОЙ дистанции до
+    -- ближайшей границы по каждой оси, а НЕ от полной скорости. Старая формула
+    -- при |vy| >= height-1 давала sy ≈ ±1 — ровно половину периода зеркала;
+    -- мяч залипал в цикле «отскок→возврат» и никогда не долетал до ворот.
+    -- ВАЖНО №2 (аудит): для оси X берём дистанцию до ЛИНИИ РАКЕТКИ, а не до
+    -- линии ворот. Иначе медленный мяч шагал крупными подшагами и проверял
+    -- попадание в ракетку только в конце шага — промах мимо края ракетки
+    -- превращался в «фантомный сейв»: мяч телепортировался на поверхность
+    -- ракетки и отбивался, хотя реально пролетал над/под её краем.
     local lx = c.paddleX_L
     local rx = c.width - lx - 1  -- правая ракетка симметрично, ширина 2
 
     local yTop, yBot = 1, c.height - c.ballH + 1
-    -- Границы ворот: мяч «пропущен», когда полностью за полем:
-    --   левые ворота: ballX + ballW < 1  =>  ballX < 1 - ballW
-    --   правые ворота: ballX > width     =>  пересечение на ballX = width + 1
-    local xGoalL, xGoalR = 1 - c.ballW, c.width + 1
+    -- Линии пересечения, после которых мяч считается пропущенным (см. гол ниже).
+    local xGoalL, xGoalR = -c.ballW, c.width + 1
 
-    -- Оставшаяся дистанция до ближайшей границы по каждой оси (не до полной
-    -- скорости!) — иначе при |v| >= H-1 подшаг равнялся бы ровно периоду
-    -- зеркального отражения и целочисленный y залипал бы («невидимый гол»):
-    -- мяч никогда не долетал до ворот и раунд не завершался.
+    -- Максимальный размер подшага: строго меньше ширины зоны detection ракетки
+    -- (3 клетки) и меньше шага, при котором возможно двойное прохождение
+    -- поля по Y за один подшаг.
+    local maxStep = 0.5
+
+    local function axisRemainder(v, pos, linePaddle, lineGoal)
+        if v == 0 then return 0 end
+        local d = (v > 0) and (lineGoal - pos) or (pos - lineGoal)
+        if v > 0 and pos < linePaddle then
+            local dp = linePaddle - pos
+            if dp > 0 and dp < d then d = dp end
+        elseif v < 0 and pos > linePaddle then
+            local dp = pos - linePaddle
+            if dp > 0 and dp < d then d = dp end
+        end
+        if d < 0 then d = 0 end
+        return d
+    end
+
     local remY
     if s.vy > 0 then
         remY = yBot - s.ballY
@@ -126,19 +143,13 @@ function M.update(s, keys)
         remY = 0
     end
     if remY < 0 then remY = 0 end
-    local remX
-    if s.vx > 0 then
-        remX = xGoalR - s.ballX
-    elseif s.vx < 0 then
-        remX = s.ballX - xGoalL
-    else
-        remX = 0
-    end
-    if remX < 0 then remX = 0 end
+    local remXL = axisRemainder(s.vx, s.ballX, lx + 2, xGoalL)
+    local remXR = axisRemainder(s.vx, s.ballX, rx - c.ballW, xGoalR)
+    local remX = math.max(remXL, remXR)
 
-    local maxStep = 1.0
     local nsub = math.floor(math.max(remY, remX) / maxStep) + 1
     if nsub < 1 then nsub = 1 end
+    if nsub > 256 then nsub = 256 end   -- страховка от взрыва при абсурдных vx/vy
     local sx = s.vx / nsub
     local sy = s.vy / nsub
 
@@ -184,12 +195,17 @@ function M.update(s, keys)
         end
     end
 
-    -- Гол
-    if s.ballX + c.ballW < 1 then
+    -- Гол: мяч «пропущен», когда ЦЕЛИКОМ за линией ворот.
+    -- ВАЖНО (аудит): раньше левый гол проверялся как `ballX + ballW < 1`, но
+    -- физика оставляет мяч на линии ракетки lx+2=5 и дальше не двигает его,
+    -- если он уже пересекал зону ракетки в прошлом кадре (remX=0). Условие
+    -- `ballX < 5` недостижимо — мяч залипал на границе зоны навсегда (вечный
+    -- розыгрыш). Правая сторона симметрично: `ballX > rx - 1`.
+    if s.ballX < lx then
         s.scoreR = s.scoreR + 1
         s.state = "round"
         s.msg = "Right scores!"
-    elseif s.ballX > c.width then
+    elseif s.ballX > rx then
         s.scoreL = s.scoreL + 1
         s.state = "round"
         s.msg = "Left scores!"

@@ -1,10 +1,15 @@
 -- ============================================================
 --  test_listFiles.lua — 70 тестов для listFiles.lua
---  Запуск: lua test_listFiles.lua [path\to\listFiles.lua]
+--  Запуск: lua test_listFiles.lua [path\to\paths.lua]
+--        (или переменная окружения LISTFILES_MODULE)
 --  Требует: Windows, io.popen, cmd.exe (как и сам модуль)
 -- ============================================================
 
-local modulePath = (arg and arg[1]) or "listFiles.lua"
+-- По умолчанию — paths.lua (модуль listFiles.lua был объединён в
+-- paths.lua); путь можно переопределить: аргументом или LISTFILES_MODULE.
+local modulePath = (arg and arg[1])
+                or (os.getenv and os.getenv("LISTFILES_MODULE"))
+                or "paths.lua"
 local M = dofile(modulePath)
 
 -- ------------------------------------------------------------
@@ -202,8 +207,10 @@ test("19 drive root join",
     function() eq(M.joinPath("C:\\", "bar"), "C:\\bar") end)
 test("20 bare drive letter join",
     function() eq(M.joinPath("C:", "bar"), "C:\\bar") end)
-test("21 empty name allowed",
-    function() eq(M.joinPath("C:\\foo", ""), "C:\\foo\\") end)
+test("21 empty name allowed (pathCombine: старый контракт listFiles)",
+    function() eq(M.pathCombine("C:\\foo", ""), "C:\\foo\\") end)
+test("21b joinPath trims trailing separator (новый контракт paths)",
+    function() eq(M.joinPath("C:\\foo", ""), "C:\\foo") end)
 test("22 non-string name raises",
     function() errs(function() M.joinPath("C:\\foo", 42) end) end)
 

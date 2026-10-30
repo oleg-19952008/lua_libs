@@ -203,8 +203,12 @@ eq(paths.joinPath("dir",    ""),    "dir",        "dir + empty")
 throws(function() paths.joinPath(123, "foo") end, "number a")
 throws(function() paths.joinPath("foo", 123) end, "number b")
 
-eq(paths.pathCombine("dir", "foo"), "dir\\foo", "pathCombine alias")
-ok(paths.joinPath == paths.pathCombine, "joinPath == pathCombine")
+eq(paths.pathCombine("dir", "foo"), "dir\\foo", "pathCombine basic")
+-- pathCombine — режим обратной совместимости со старым listFiles.lua:
+-- пустой второй аргумент оставляет хвостовой слэш (joinPath — нет).
+eq(paths.pathCombine("dir", ""),    "dir\\",  "pathCombine dir + empty")
+eq(paths.pathCombine("dir\\", "x"), "dir\\x", "pathCombine trailing kept")
+ok(not (paths.joinPath == paths.pathCombine), "joinPath ~= pathCombine (разные контракты)")
 
 -- ============================================================
 -- 7. utf16leToUtf8

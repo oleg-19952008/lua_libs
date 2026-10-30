@@ -112,23 +112,30 @@ function M.update(s, keys)
     local rx = c.width - lx - 1  -- правая ракетка симметрично, ширина 2
 
     local yTop, yBot = 1, c.height - c.ballH + 1
-    -- Линии пересечения, после которых мяч считается пропущенным (см. гол ниже).
-    local xGoalL, xGoalR = -c.ballW, c.width + 1
+    -- Линии полного пересечения ворот (мяч целиком за границей поля):
+    -- слева — x <= -ballW, справа — x + ballW >= width + 1, т.е. x >= width+1-ballW.
+    local xGoalL, xGoalR = -c.ballW, c.width + 1 - c.ballW
 
     -- Максимальный размер подшага: строго меньше ширины зоны detection ракетки
     -- (3 клетки) и меньше шага, при котором возможно двойное прохождение
     -- поля по Y за один подшаг.
     local maxStep = 0.5
 
+    -- ВАЖНО (аудит): раньше остаток брался как max(remXL, remXR) от линии
+    -- ворот, которая лежит ЗА зоной detection ракетки. Когда мяч пересекал
+    -- линию ракетки и летел к воротам, «остаток до события» становился больше
+    -- всего поля (65-58=7), substepping терял смысл и единственный подшаг
+    -- проскакивал зону detection ПРОТИВОПОЛОЖНОЙ ракетки насквозь.
+    -- Теперь: если мяч ещё НЕ достиг линии своей ракетки по направлению
+    -- движения — цель именно она; если уже прошёл её (пропущен) — цель
+    -- линия ворот. Берём min: подшаг обязан остановиться на БЛИЖАЙШЕМ событии.
     local function axisRemainder(v, pos, linePaddle, lineGoal)
         if v == 0 then return 0 end
-        local d = (v > 0) and (lineGoal - pos) or (pos - lineGoal)
-        if v > 0 and pos < linePaddle then
-            local dp = linePaddle - pos
-            if dp > 0 and dp < d then d = dp end
-        elseif v < 0 and pos > linePaddle then
-            local dp = pos - linePaddle
-            if dp > 0 and dp < d then d = dp end
+        local d
+        if v > 0 then
+            if pos < linePaddle then d = linePaddle - pos else d = lineGoal - pos end
+        else
+            if pos > linePaddle then d = pos - linePaddle else d = pos - lineGoal end
         end
         if d < 0 then d = 0 end
         return d
@@ -145,7 +152,7 @@ function M.update(s, keys)
     if remY < 0 then remY = 0 end
     local remXL = axisRemainder(s.vx, s.ballX, lx + 2, xGoalL)
     local remXR = axisRemainder(s.vx, s.ballX, rx - c.ballW, xGoalR)
-    local remX = math.max(remXL, remXR)
+    local remX = math.min(remXL, remXR)
 
     local nsub = math.floor(math.max(remY, remX) / maxStep) + 1
     if nsub < 1 then nsub = 1 end
@@ -168,8 +175,11 @@ function M.update(s, keys)
             s.vy = -s.vy; sy = -sy
         end
 
-        -- Столкновение с левой ракеткой (проверка только при движении влево)
-        if sx < 0 and s.ballX <= lx + 2 and s.ballX >= lx - 1 then
+        -- Столкновение с левой ракеткой (проверка только при движении влево).
+        -- ВАЖНО (аудит): зона входа дополнена линией ворот xGoalL — иначе
+        -- пропущенный мяч, ушедший за xGoalL=-2, переставал попадать в окно
+        -- [lx-1..lx+2] и гол фиксировался только когда он уже был мёртв.
+        if sx < 0 and s.ballX <= lx + 2 and s.ballX >= xGoalL then
             if s.ballY + c.ballH - 1 >= s.leftY and s.ballY <= s.leftY + c.paddleH - 1 then
                 s.ballX = lx + 2
                 local rel = ((s.ballY + c.ballH / 2) - (s.leftY + c.paddleH / 2)) / (c.paddleH / 2)
@@ -181,8 +191,8 @@ function M.update(s, keys)
             end
         end
 
-        -- Столкновение с правой ракеткой
-        if sx > 0 and s.ballX + c.ballW >= rx and s.ballX <= rx + 1 then
+        -- Столкновение с правой ракеткой (симметрично, зона до xGoalR)
+        if sx > 0 and s.ballX + c.ballW >= rx and s.ballX <= xGoalR then
             if s.ballY + c.ballH - 1 >= s.rightY and s.ballY <= s.rightY + c.paddleH - 1 then
                 s.ballX = rx - c.ballW
                 local rel = ((s.ballY + c.ballH / 2) - (s.rightY + c.paddleH / 2)) / (c.paddleH / 2)
@@ -196,16 +206,20 @@ function M.update(s, keys)
     end
 
     -- Гол: мяч «пропущен», когда ЦЕЛИКОМ за линией ворот.
-    -- ВАЖНО (аудит): раньше левый гол проверялся как `ballX + ballW < 1`, но
+    -- ВАЖНО (аудит №2): раньше левый гол проверялся как `ballX < lx` (=3), но
     -- физика оставляет мяч на линии ракетки lx+2=5 и дальше не двигает его,
     -- если он уже пересекал зону ракетки в прошлом кадре (remX=0). Условие
-    -- `ballX < 5` недостижимо — мяч залипал на границе зоны навсегда (вечный
-    -- розыгрыш). Правая сторона симметрично: `ballX > rx - 1`.
-    if s.ballX < lx then
+    -- `ballX < 5` было недостижимо — пропущенный мяч залипал навсегда
+    -- (вечный розыгрыш). Правая сторона симметрично: `ballX > rx` (=60)
+    -- срабатывало, когда правый край мяча был ЕЩЁ ВНУТРИ поля (x=61 =>
+    -- мяч занимает клетки 61..62 из 1..64) — гол засчитывался на полкорпуса
+    -- раньше линии. Теперь целиком за границей: слева x <= -ballW, справа
+    -- x + ballW >= width + 1.
+    if s.ballX <= xGoalL then
         s.scoreR = s.scoreR + 1
         s.state = "round"
         s.msg = "Right scores!"
-    elseif s.ballX > rx then
+    elseif s.ballX >= xGoalR then
         s.scoreL = s.scoreL + 1
         s.state = "round"
         s.msg = "Left scores!"

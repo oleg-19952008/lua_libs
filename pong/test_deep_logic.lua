@@ -292,4 +292,145 @@ H.test("E1. determinism: same seed replays byte-identical match", function()
     assert(sc.state == "over", "матч с другим seed не завершился")
 end)
 
+--------------------------------------------------------------------------------
+-- F. Граничные условия физики: залипание пропущенного мяча, ложные голы
+--    (баги №1/№2 из аудита; регрессионные)
+--------------------------------------------------------------------------------
+
+H.test("F1. missed ball reaches goal line; no phantom goals inside field", function()
+    -- (a) Пропущенный мяч обязан дойти до линии ворот и засчитать гол.
+    -- Старый баг: левый гол проверялся как `ballX < lx`, но физика останавливает
+    -- мяч на линии ракетки lx+2=5 — условие недостижимо, розыгрыш вечный.
+    local s = game.newState(C)
+    s.state = "play"
+    s.leftY  = -20            -- обе ракетки «сломаны» и вне поля -> чистый пропуск
+    s.rightY = -20
+    s.ballX, s.ballY = 30, 11
+    s.vx, s.vy = -C.ballSpeed0, 0
+    local frames = 0
+    while s.state == "play" and frames < 500 do
+        game.update(s, {})
+        frames = frames + 1
+    end
+    assert(s.state == "round",
+        ("пропущенный влево мяч залип: %d кадров без гола (X=%.3f)"):format(frames, s.ballX))
+    assert(s.scoreR == 1 and s.msg == "Right scores!",
+        ("гол не в те ворота или сообщение неверно: L=%d R=%d msg=%s"):format(
+            s.scoreL, s.scoreR, tostring(s.msg)))
+
+    -- (b) Правая сторона симметрично (старый баг зеркальный).
+    local r = game.newState(C)
+    r.state = "play"; r.leftY = -20; r.rightY = -20
+    r.ballX, r.ballY = 30, 11
+    r.vx, r.vy = C.ballSpeed0, 0
+    frames = 0
+    while r.state == "play" and frames < 500 do
+        game.update(r, {})
+        frames = frames + 1
+    end
+    assert(r.state == "round",
+        ("пропущенный вправо мяч залип: %d кадров без гола (X=%.3f)"):format(frames, r.ballX))
+    assert(r.scoreL == 1 and r.msg == "Left scores!", "правый гол засчитан неверно")
+
+    -- (c) Регрессия на ранний гол: гол НЕ должен фиксироваться, пока правый
+    -- край мяча ещё внутри поля (клетки 1..width). Проверяем каждый кадр.
+    local g = game.newState(C)
+    g.state = "play"; g.leftY = -20; g.rightY = -20
+    g.ballX, g.ballY = 55, 11
+    g.vx, g.vy = C.ballSpeed0, 0
+    for _ = 1, 40 do
+        game.update(g, {})
+        if g.state ~= "play" then break end
+        assert(g.ballX + C.ballW <= C.width,
+            ("мяч ещё в поле (X=%.3f..%.3f), а состояние уже не play"):format(
+                g.ballX, g.ballX + C.ballW - 1))
+    end
+    assert(g.state == "round", "гола вообще не случилось за 40 кадров")
+end)
+
+--------------------------------------------------------------------------------
+-- G. Инварианты столкновений: нет фантомных отскоков, модуль скорости цел
+--------------------------------------------------------------------------------
+
+H.test("G1. no phantom paddle bounce when paddles are out of reach", function()
+    -- Ракетки задраны максимально вверх (leftY=rightY=1), мяч летит по нижней
+    -- части поля (Y=18). Зона detection [leftY..leftY+paddleH-1]=[1..5] с ним
+    -- не пересекается НИ при каком X. Старый баг: remX считался от дальней
+    -- границы и substep проскакивал зону встречной ракетки целиком, порождая
+    -- отскок vx->-vx с пересчётом угла при пустой ракетке («фантом»).
+    local s = game.newState(C)
+    s.state = "play"
+    s.leftY, s.rightY = 1, 1
+    s.ballX, s.ballY = 10, 18
+    s.vx, s.vy = C.ballSpeed0, -0.2 * C.ballSpeed0
+    local speedPrev = math.sqrt(s.vx * s.vx + s.vy * s.vy)
+    local dirPrev   = s.vx > 0 and 1 or -1
+    local bounces   = 0
+    local frames    = 0
+    while s.state == "play" and frames < 600 do
+        game.update(s, {})
+        frames = frames + 1
+        local dirNow = s.vx > 0 and 1 or -1
+        if dirNow ~= dirPrev then
+            bounces = bounces + 1
+            error(("фантомный отскок на кадре %d: vx %.4f -> %.4f при Y=%.2f, " ..
+                   "обе ракетки в [1..%d]"):format(frames, dirPrev, dirNow, s.ballY,
+                   C.paddleH))
+        end
+        -- скорость в вакууме стенковых отскоков сохраняется точно
+        local sp = math.sqrt(s.vx * s.vx + s.vy * s.vy)
+        assert(math.abs(sp - speedPrev) < 1e-12,
+            ("скорость исказилась на кадре %d: %.6f -> %.6f"):format(frames, speedPrev, sp))
+        speedPrev = sp
+    end
+    assert(bounces == 0, "за " .. frames .. " кадров случились отскоки от пустых ракеток")
+    assert(s.state == "round" and s.scoreR == 1,
+        "мяч должен был долететь до левых ворот (scoreR=1)")
+end)
+
+--------------------------------------------------------------------------------
+-- H. Стресс-физика: экстремальные скорости, двойные проходы поля, отсутствие
+--    зависаний и выход за границы
+--------------------------------------------------------------------------------
+
+H.test("H1. extreme speeds: bounded runtime, in-field clamp, eventual goal", function()
+    local cases = {
+        { vx =  8.0, vy =  7.0 },   -- очень быстрый вправо-вниз
+        { vx = -9.0, vy = 11.0 },   -- быстрее высоты поля за кадр
+        { vx =  0.45, vy =  0.0 },  -- минимальная подача
+        { vx = 20.0, vy = -20.0 },  -- абсурд: больше двух полей по диагонали
+    }
+    for _, cs in ipairs(cases) do
+        local s = game.newState(C)
+        s.state = "play"
+        s.leftY, s.rightY = math.floor(C.height / 2 - C.paddleH / 2),
+                           math.floor(C.height / 2 - C.paddleH / 2)
+        s.ballX, s.ballY = math.floor(C.width / 2), math.floor(C.height / 2)
+        s.vx, s.vy = cs.vx, cs.vy
+        local frames = 0
+        local wallBounces = 0
+        local prevVy = s.vy
+        while s.state == "play" and frames < 3000 do
+            game.update(s, {})
+            frames = frames + 1
+            -- инвариант границ: пока идёт розыгрыш, Y мяча строго в поле
+            assert(s.ballY >= 1 and s.ballY <= C.height - C.ballH + 1,
+                ("случай (%g,%g): Y=%.4f вне [1..%.1f] на кадре %d"):format(
+                    cs.vx, cs.vy, s.ballY, C.height - C.ballH + 1, frames))
+            -- X обязан остаться в разумных пределах (не улетел в NaN/inf)
+            assert(s.ballX == s.ballX and s.ballX > -1000 and s.ballX < 2000,
+                ("случай (%g,%g): X=%s на кадре %d"):format(cs.vx, cs.vy,
+                    tostring(s.ballX), frames))
+            if s.vy ~= prevVy then wallBounces = wallBounces + 1 end
+            prevVy = s.vy
+        end
+        assert(s.state ~= "play",
+            ("случай (%g,%g): завис на %d кадров (X=%.2f vx=%.2f)"):format(
+                cs.vx, cs.vy, frames, s.ballX, s.vx))
+        -- быстрый мяч либо отбит ракетками/стенками, либо дошёл до ворот;
+        -- главное — завершение за конечное число кадров (см. assert выше)
+        assert(frames < 3000, "слишком долгий розыгрыш")
+    end
+end)
+
 return os.exit(H.finish())

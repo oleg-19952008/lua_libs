@@ -55,6 +55,7 @@ function M.resetBall(s, dir, randFn)
     local c = s.cfg
     s.ballX = math.floor(c.width / 2)
     s.ballY = math.floor(c.height / 2)
+    s.fx, s.fy = 0, 0   -- дробь позиции при подаче обнуляется
     if randFn then s.randFn = randFn end
     local src = s.randFn or math.random
     local angle = (src() * 2 - 1) * 0.35
@@ -72,6 +73,24 @@ local function clamp(v, lo, hi)
     return v
 end
 
+--- Дискретизация непрерывной позиции мяча в клетки терминала.
+-- Позиция хранится целыми ballX/ballY, дробь накапливается в s.fx/s.fy —
+-- иначе при |v| < 1 клетка не менялась бы ни за один кадр («залипание»).
+-- Возвращает nx, ny (клетки), fx, fy (остатки дроби).
+local function discretize(s, bx, by)
+    local nx = math.floor(bx + 0.5)
+    local ny = math.floor(by + 0.5)
+    local fx = (s.fx or 0) + (bx - nx)
+    local fy = (s.fy or 0) + (by - ny)
+    -- Перенос накопившейся дроби в целые клетки (страховочные циклы;
+    -- за нормальную игру |fx| остаётся < 1).
+    while fx >= 1 do fx = fx - 1 nx = nx + 1 end
+    while fx <= -1 do fx = fx + 1 nx = nx - 1 end
+    while fy >= 1 do fy = fy - 1 ny = ny + 1 end
+    while fy <= -1 do fy = fy + 1 ny = ny - 1 end
+    return nx, ny, fx, fy
+end
+
 --- dirL/dirR: -1 вверх, 0 покой, +1 вниз (для игрока слева, W/S или стрелки).
 -- ИИ ходит автоматически к мячу.
 function M.update(s, keys)
@@ -81,6 +100,11 @@ function M.update(s, keys)
     if s.state ~= "play" then
         return
     end
+
+    -- Служебные поля непрерывной позиции (см. discretize): создаём, если
+    -- состояние собрано вне newState/resetBall (ручные таблицы в тестах).
+    if s.fx == nil then s.fx = 0 end
+    if s.fy == nil then s.fy = 0 end
 
     -- Игрок: W/S или стрелки вверх/вниз
     local dy = 0
@@ -98,27 +122,27 @@ function M.update(s, keys)
     end
 
     ------------------------------------------------------------------------
-    -- Физика мяча: событийная модель, ОДНО событие за кадр.
-    -- Исправленные баги предыдущих версий:
-    --   1) «Фантомные» отскоки/сейвы: столкновение проверялось ПОСЛЕ
-    --      перемещения по всему шагу; теперь перекрытие по Y вычисляется в
-    --      ТОЧКЕ касания лицевой стороны ракетки (по времени достижения);
-    --   2) Ранние голы: раньше «гол» был событием траектории и выбирался
-    --      внутри кадра как min(dWall, dHit, dGoal) — при промахе мимо
-    --      ракетки следующий сегмент мгновенно доматывал мяч до линии ворот
-    --      (мяч телепортировался к гола за один кадр). Теперь гол — это
-    --      ДИСКРЕТНОЕ условие начала кадра: засчитывается только когда левый
-    --      край мяча реально пересёк линию полного пропуска (шаг 0), либо
-    --      когда достигнута линия ворот из полости за ракеткой (шаг 3);
-    --   3) Залипание пропущенного мяча: после промаха мяч остаётся на
-    --      лицевой стороне; пока ракета не вернулась под мяч, на следующем
-    --      кадре фиксируется пропуск (шаг 1) — мёртвой зоны больше нет;
-    --   4) Искажение |v| на стенке: vy меняет только знак.
+    -- Физика мяча: фиксированный шаг + событийное разрешение столкновений.
+    -- Контракт (закреплён тестами test_logic.lua):
+    --   1) За кадр мяч смещается РОВНО на (vx, vy) — никаких «недошагов»
+    --      и телепортов; события (стены/лицевые/линии голов) разрешаются
+    --      внутри шага в хронологическом порядке по времени достижения,
+    --      остаток кадра доматывается по новому вектору;
+    --   2) Сейв проверяется по перекрытию по Y В ТОЧКЕ касания лицевой
+    --      стороны ракетки — «фантомных» отскоков от пустых участков нет;
+    --   3) Промах: мяч залипает ровно на лицевой стороне (без прыжка к
+    --      воротам); на следующем кадре шаг 0/1 решает — сейв (ракета
+    --      вернулась под мяч) или дискретный гол (ушла);
+    --   4) Гол засчитывается ровно один раз за розыгрыш: как только левый
+    --      край мяча пересёк линию полного пропуска (шаг 0 — условие
+    --      начала кадра, либо событие внутри шага 2);
+    --   5) Стена меняет только знак vy (|v| не искажается);
+    --   6) Позиция хранится целыми клетками терминала, дробь шага
+    --      накапливается в s.fx/s.fy (иначе при |v|<1 мяч стоял бы на месте).
     ------------------------------------------------------------------------
 
     local EPS = 1e-9
     local yTop, yBot = 1, c.height - c.ballH + 1   -- границы левого края мяча по Y
-    local period = 2 * (c.height - c.ballH)         -- период зеркального отражения
 
     -- Позиция ЛЕВОГО КРАЯ мяча:
     local lx = c.paddleX_L                          -- левая ракетка: клетки [lx..lx+1]
@@ -128,7 +152,9 @@ function M.update(s, keys)
     local edgeL, edgeR = faceL, faceR               -- линии касания лицевых сторон
     local goalL, goalR = -c.ballW, c.width  -- линии полного пропуска (гол)
 
-    local bx, by = s.ballX, s.ballY
+    -- Непрерывная позиция = клетка + накопленная дробь (см. пункт 6).
+    local bx = s.ballX + (s.fx or 0)
+    local by = s.ballY + (s.fy or 0)
     local vx, vy = s.vx, s.vy
 
     -- Защита от нулевой горизонтальной скорости (иначе события по X
@@ -136,16 +162,21 @@ function M.update(s, keys)
     if vx == 0 then vx = 0.05 end
 
     ------------------------------------------------------------------------
-    -- ШАГ 0. Гол засчитывается ДИСКРЕТНО: если левый край мяча уже пересёк
-    -- линию полного пропуска (это могло произойти на прошлом шаге после
-    -- промаха или прямого полёта в ворота) — фиксируем гол и выходим.
-    -- Так исключается и «залипание» (прошедший лицевую сторону мяч больше
-    -- не блокируется зоной detection), и «телепорт» (гол не находится
+    -- ШАГ 0. Дискретные события начала кадра (позиция — непрерывная клетка
+    -- + накопленная дробь, см. discretize):
+    --   a) Гол: левый край мяча пересёк линию полного пропуска (это могло
+    --      произойти на прошлом шаге после промаха или прямого полёта в
+    --      ворота) — фиксируем гол и выходим;
+    --   b) Залипание на лицевой стороне встречной ракетки (после промаха в
+    --      прошлом кадре), мяч всё ещё летит К ней — ракета была подставлена
+    --      между кадрами: либо сейв (перекрытие по Y), либо пропуск/гол.
+    -- Так исключается и «залипание у ворот» (прошедший линию мяч больше не
+    -- блокируется зоной detection), и «телепорт» (гол не находится
     -- внутрикадровым поиском событий раньше времени).
-    -- ВАЖНО: гол проверяется ДО касания лицевой стороны (шаг 2): при
-    -- больших |vx| за один кадр мяч может пересечь и ракетку, и линию
-    -- ворот; событие по X берётся ближайшее, поэтому гол имеет приоритет.
     ------------------------------------------------------------------------
+    local stuckL = (vx < 0 and bx <= edgeL + EPS)
+    local stuckR = (vx > 0 and bx >= edgeR - EPS)
+
     if bx <= goalL then
         s.scoreR = s.scoreR + 1
         s.state, s.msg = "round", "Right scores!"
@@ -153,8 +184,37 @@ function M.update(s, keys)
         s.scoreL = s.scoreL + 1
         s.state, s.msg = "round", "Left scores!"
     end
+
+    if s.state == "play" and (stuckL or stuckR) then
+        local padY = stuckL and s.leftY or s.rightY
+        if by + c.ballH - 1 >= padY and by <= padY + c.paddleH - 1 then
+            -- Сейв из залипания: отскок по формуле удара.
+            local rel = clamp(((by + c.ballH / 2) - (padY + c.paddleH / 2)) / (c.paddleH / 2), -1, 1)
+            local speed = math.sqrt(vx * vx + vy * vy) * c.ballAccel
+            local dirOut = stuckL and 1 or -1
+            vx = dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed
+            -- Знак vy задаётся точкой попадания (выше центра ракетки — вверх):
+            -- rel=-1 соответствует ВЕРХНЕМУ краю (меньший Y) и обязан давать
+            -- восходящий отскок (vy<0).
+            vy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
+            bx = (dirOut > 0) and faceL or faceR
+            by = clamp(by, yTop, yBot)
+            local nx, ny, fxn, fyn = discretize(s, bx, by)
+            s.fx, s.fy = fxn, fyn
+            s.ballX, s.ballY, s.vx, s.vy = nx, ny, vx, vy
+            return
+        end
+        -- Ракета успели уйти — пропуск состоялся (дискретно, без телепорта).
+        if stuckL then
+            s.scoreR = s.scoreR + 1
+            s.state, s.msg = "round", "Right scores!"
+        else
+            s.scoreL = s.scoreL + 1
+            s.state, s.msg = "round", "Left scores!"
+        end
+    end
+
     if s.state ~= "play" then
-        s.ballX, s.ballY, s.vx, s.vy = bx, by, vx, vy
         if s.scoreL >= c.winScore or s.scoreR >= c.winScore then
             s.state = "over"
             -- Управление на экране конца матча — SPACE (реванш) / q (выход), см. main.lua
@@ -164,29 +224,79 @@ function M.update(s, keys)
                 s.msg = "CPU WINS! [SPACE] again  [q] quit"
             end
         end
+        -- Мяч остаётся ровно там, где остановился (у лицевой стороны или за
+        -- линией ворот); дробь при переходе в раунд обнуляется — подача всё
+        -- равно ставит мяч в центр.
+        s.fx, s.fy = nil, nil
+        s.ballX, s.ballY = math.floor(bx + 0.5), clamp(math.floor(by + 0.5), yTop, yBot)
+        s.vx, s.vy = vx, vy
         return
     end
 
     ------------------------------------------------------------------------
-    -- ШАГ 1. Мяч стоит точно на лицевой стороне встречной ракетки (после
-    -- промаха в прошлом кадре) и всё ещё летит К ней — значит ракета была
-    -- подставлена между кадрами. Либо сейв (перекрытие по Y), либо гол.
+    -- ШАГ 2. Фиксированный шаг интегрирования: за кадр мяч смещается РОВНО
+    -- на (vx, vy) — классический Pong-тайминг, без «недошагов». Все события
+    -- (стены, лицевые стороны ракеток, линии голов) разрешаются ВНУТРИ шага
+    -- по времени достижения t ∈ [0,1]; после отражения остаток кадра
+    -- доматывается по новому вектору (максимум 2 стены за шаг — больше
+    -- физически не влезает при |v| < высоты поля). Обработка событий идёт
+    -- строго в хронологическом порядке, поэтому:
+    --   * мяч никогда не пересекает событие «молча» (нет фантомов и телепортов);
+    --   * гол засчитывается ровно в тот кадр, когда левый край мяча реально
+    --     пересёк линию полного пропуска (или достиг её из полости ворот);
+    --   * сейв проверяется по перекрытию по Y В ТОЧКЕ касания лицевой стороны.
+    -- Позиция мяча хранится ЦЕЛЫМИ числами (клетки терминала): дробная
+    -- часть накапливается в s.fx/s.fy (см. discretize).
     ------------------------------------------------------------------------
-    if (vx < 0 and bx <= edgeL + EPS) or (vx > 0 and bx >= edgeR - EPS) then
-        local padY = (vx < 0) and s.leftY or s.rightY
-        if by + c.ballH - 1 >= padY and by <= padY + c.paddleH - 1 then
-            local rel = clamp(((by + c.ballH / 2) - (padY + c.paddleH / 2)) / (c.paddleH / 2), -1, 1)
-            local speed = math.sqrt(vx * vx + vy * vy) * c.ballAccel
-            local dirOut = (vx < 0) and 1 or -1
-            vx = dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed
-            -- Знак vy задаётся точкой попадания (выше центра ракетки — вверх),
-            -- а не знаком rel: на левой ракетке rel=-1 соответствует ВЕРХНЕМУ
-            -- краю (меньший Y) и обязан давать восходящий отскок (vy<0).
-            vy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
-            bx = (dirOut > 0) and faceL or faceR
+    local remaining = 1                             -- доля кадра (в шагах = 1.0)
+    local guard = 0
+
+    while remaining > EPS do
+        guard = guard + 1
+        if guard > 4 then break end                 -- страховка от вырожденных векторов
+
+        -- Время (в долях оставшегося шага) до ближайшего события по X.
+        local dEdge, kindX
+        if vx < 0 then
+            if bx > edgeL then dEdge = (bx - edgeL) / (-vx); kindX = "edgeL"
+            else               dEdge = (bx - goalL) / (-vx); kindX = "goalL"
+            end
         else
-            -- Ракета успели уйти — пропуск состоялся.
-            if vx < 0 then
+            if bx < edgeR then dEdge = (edgeR - bx) / vx; kindX = "edgeR"
+            else             dEdge = (goalR - bx) / vx; kindX = "goalR"
+            end
+        end
+        if dEdge < 0 then dEdge = 0 end             -- мы уже на линии/за ней
+
+        -- Время до стены по Y (если летим к стене).
+        local dWall
+        if vy > EPS then
+            dWall = (yBot - by) / vy
+        elseif vy < -EPS then
+            dWall = (by - yTop) / (-vy)
+        else
+            dWall = nil
+        end
+        if dWall and dWall < 0 then dWall = 0 end
+
+        local t = remaining
+        local ev = nil
+        if dWall ~= nil and dWall < t then t, ev = dWall, "wall" end
+        if dEdge < t then t, ev = dEdge, kindX end
+
+        -- Продвигаемся к событию (или до конца кадра).
+        bx = bx + vx * t
+        by = by + vy * t
+        remaining = remaining - t
+
+        if ev == "wall" then
+            vy = -vy                                -- только знак vy, |v| не трогаем
+            -- Страховка от float-дрейфа: держим мяч в границах поля.
+            if by < yTop then by = yTop elseif by > yBot then by = yBot end
+
+        elseif ev == "goalL" or ev == "goalR" then
+            -- Линия полного пропуска достигнута внутри шага — дискретный гол.
+            if ev == "goalL" then
                 s.scoreR = s.scoreR + 1
                 s.state, s.msg = "round", "Right scores!"
             else
@@ -201,99 +311,46 @@ function M.update(s, keys)
                     s.msg = "CPU WINS! [SPACE] again  [q] quit"
                 end
             end
-        end
-        s.ballX, s.ballY, s.vx, s.vy = bx, by, vx, vy
-        return
-    end
+            -- Гол: фиксируем позицию как есть (мяч за линией ворот), дробь
+            -- сбрасываем — раунд всё равно перезапускает подачу из центра.
+            s.fx, s.fy = nil, nil
+            s.ballX, s.ballY, s.vx, s.vy = math.floor(bx + 0.5), clamp(math.floor(by + 0.5), yTop, yBot), vx, vy
+            return
 
-    ------------------------------------------------------------------------
-    -- ШАГ 2. Полёт до следующего события. Граница движения — лицевая
-    -- сторона встречной ракетки (за неё мяч без проверки Y не проходит —
-    -- защита от фантомных отскоков) ИЛИ линия гола (для мячей, уже
-    -- находящихся в полости ворот — защита от залипания). Событие «стенка»
-    -- может произойти раньше. За пределы одного события кадр не выходит:
-    -- никакого телепорта к воротам.
-    ------------------------------------------------------------------------
-    local limit
-    if vx < 0 then
-        if bx > edgeL then limit = (bx - edgeL) / (-vx) else limit = (bx - goalL) / (-vx) end
-    else
-        if bx < edgeR then limit = (edgeR - bx) / vx else limit = (goalR - bx) / vx end
-    end
-
-    local dWall
-    if vy > EPS then
-        dWall = (yBot - by) / vy
-    elseif vy < -EPS then
-        dWall = (by - yTop) / (-vy)
-    else
-        dWall = nil
-    end
-
-    local dMin, kind
-    if dWall ~= nil and dWall < limit then
-        dMin, kind = dWall, "wall"
-    else
-        dMin, kind = limit, "edge"
-    end
-
-    bx = bx + vx * dMin
-    by = by + vy * dMin
-
-    if kind == "wall" then
-        vy = -vy
-    elseif bx <= goalL or bx >= goalR then
-        ------------------------------------------------------------------
-        -- Достигнута линия гола (мяч был в полости ворот) — сразу в этом
-        -- же кадре: иначе розыгрыш мог бы зависнуть между шагами 0/1.
-        ------------------------------------------------------------------
-        if vx < 0 then
-            s.scoreR = s.scoreR + 1
-            s.state, s.msg = "round", "Right scores!"
-        else
-            s.scoreL = s.scoreL + 1
-            s.state, s.msg = "round", "Left scores!"
-        end
-        if s.scoreL >= c.winScore or s.scoreR >= c.winScore then
-            s.state = "over"
-            if s.scoreL >= c.winScore then
-                s.msg = "YOU WIN!  [SPACE] again  [q] quit"
-            else
-                s.msg = "CPU WINS! [SPACE] again  [q] quit"
+        elseif ev == "edgeL" or ev == "edgeR" then
+            ------------------------------------------------------------------
+            -- Касание лицевой стороны встречной ракетки. Перекрытие по Y
+            -- проверяется В ТОЧКЕ касания: сейв (отскок с ускорением и
+            -- переостатком кадра) либо промах (мяч залипает на лицевой —
+            -- ракета успела уйти; гол зафиксируется шагом 0/1 в следующем
+            -- кадре, без телепорта к воротам).
+            ------------------------------------------------------------------
+            local padY = (ev == "edgeL") and s.leftY or s.rightY
+            local hit = (by + c.ballH - 1 >= padY) and (by <= padY + c.paddleH - 1)
+            if not hit then
+                bx = (ev == "edgeL") and faceL or faceR
+                break                               -- залипание: вектор не меняем
             end
-        end
-        s.ballX, s.ballY, s.vx, s.vy = bx, by, vx, vy
-        return
-    else
-        ------------------------------------------------------------------
-        -- Касание лицевой стороны: перекрытие по Y проверяется В ТОЧКЕ
-        -- касания (никаких фантомных отскоков от пустых участков).
-        ------------------------------------------------------------------
-        local padY = (vx < 0) and s.leftY or s.rightY
-        if by + c.ballH - 1 >= padY and by <= padY + c.paddleH - 1 then
-            -- Сейв: угол по точке попадания + ускорение
             local rel = clamp(((by + c.ballH / 2) - (padY + c.paddleH / 2)) / (c.paddleH / 2), -1, 1)
             local speed = math.sqrt(vx * vx + vy * vy) * c.ballAccel
-            local dirOut = (vx < 0) and 1 or -1
+            local dirOut = (ev == "edgeL") and 1 or -1
             vx = dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed
-            -- Знак vy — по точке попадания (см. шаг 1): выше центра ракетки
-            -- (rel<0, меньший Y) -> мяч уходит вверх (vy<0).
+            -- Знак vy задаётся точкой попадания (выше центра ракетки — вверх):
+            -- rel<0 (меньший Y, верхний край) обязан давать восходящий отскок.
             vy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
             bx = (dirOut > 0) and faceL or faceR
+            -- Остаток кадра доматывается ниже по новому вектору.
         end
-        -- Промах: мяч остаётся ровно на лицевой стороне ракетки; дальше
-        -- шаг 1 решит — сейв (ракета вернулась) или гол (ушла).
     end
 
-    -- Финишная нормализация Y (страховка от накопления float-погрешности):
-    -- зеркальное отображение по периоду 2*(H-ballH).
-    if by < yTop or by > yBot then
-        local y = (by - 1) % period
-        if y > period / 2 then y = period - y end
-        by = 1 + y
-    end
+    -- Финишная страховка: мяч обязан остаться в границах поля по Y
+    -- (нормализация float-дрейфа на случай вырожденных векторов).
+    by = clamp(by, yTop, yBot)
 
-    s.ballX, s.ballY = bx, by
+    -- Дискретизация в клетки терминала с переносом дроби (см. discretize).
+    local nx, ny, fxn, fyn = discretize(s, bx, by)
+    s.fx, s.fy = fxn, fyn
+    s.ballX, s.ballY = nx, ny
     s.vx, s.vy = vx, vy
 end
 

@@ -166,11 +166,22 @@ local function run()
             for k in pairs(fresh) do keysHeld[k] = true end
         end
 
-        -- Логика
+        -- Логика. s.lastNow — «часы» текущего кадра: game.handleRound при
+        -- now=nil обязан видеть актуальное время, иначе roundUntil считается
+        -- от застывшего lastNow=0 и раунд никогда не завершается.
+        s.lastNow = os.clock()
         if s.state == "play" then
             game.update(s, keysHeld)
         elseif s.state == "round" then
-            game.handleRound(s, os.clock())
+            game.handleRound(s, s.lastNow)
+        end
+
+        -- Протокол голов: ровно одна запись на вход в раунд (dedup по
+        -- флагу goalCounted внутри handleRound/popGoal).
+        local g = game.popGoal(s)
+        if g then
+            if not s.goalLog then s.goalLog = {} end
+            table.insert(s.goalLog, g)
         end
 
         -- В строковом фолбэке (нет raw-режима) сбрасываем удержание после кадра

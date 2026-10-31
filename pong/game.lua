@@ -142,6 +142,9 @@ function M.update(s, keys)
     -- Так исключается и «залипание» (прошедший лицевую сторону мяч больше
     -- не блокируется зоной detection), и «телепорт» (гол не находится
     -- внутрикадровым поиском событий раньше времени).
+    -- ВАЖНО: гол проверяется ДО касания лицевой стороны (шаг 2): при
+    -- больших |vx| за один кадр мяч может пересечь и ракетку, и линию
+    -- ворот; событие по X берётся ближайшее, поэтому гол имеет приоритет.
     ------------------------------------------------------------------------
     if bx <= goalL then
         s.scoreR = s.scoreR + 1
@@ -176,7 +179,10 @@ function M.update(s, keys)
             local speed = math.sqrt(vx * vx + vy * vy) * c.ballAccel
             local dirOut = (vx < 0) and 1 or -1
             vx = dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed
-            vy = math.sin(rel * c.maxBounceAngle) * speed
+            -- Знак vy задаётся точкой попадания (выше центра ракетки — вверх),
+            -- а не знаком rel: на левой ракетке rel=-1 соответствует ВЕРХНЕМУ
+            -- краю (меньший Y) и обязан давать восходящий отскок (vy<0).
+            vy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
             bx = (dirOut > 0) and faceL or faceR
         else
             -- Ракета успели уйти — пропуск состоялся.
@@ -270,7 +276,9 @@ function M.update(s, keys)
             local speed = math.sqrt(vx * vx + vy * vy) * c.ballAccel
             local dirOut = (vx < 0) and 1 or -1
             vx = dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed
-            vy = math.sin(rel * c.maxBounceAngle) * speed
+            -- Знак vy — по точке попадания (см. шаг 1): выше центра ракетки
+            -- (rel<0, меньший Y) -> мяч уходит вверх (vy<0).
+            vy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
             bx = (dirOut > 0) and faceL or faceR
         end
         -- Промах: мяч остаётся ровно на лицевой стороне ракетки; дальше

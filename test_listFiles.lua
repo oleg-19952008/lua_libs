@@ -3,6 +3,9 @@
 --  Запуск: lua test_listFiles.lua [path\to\paths.lua]
 --        (или переменная окружения LISTFILES_MODULE)
 --  Требует: Windows, io.popen, cmd.exe (как и сам модуль)
+--  Вне Windows чистые (string-операции) группы выполняются, а
+--  группы, зависящие от файловой системы/cmd.exe, помечаются
+--  skipped ('s') и НЕ считаются падениями (exit code 0).
 -- ============================================================
 
 -- По умолчанию — paths.lua (модуль listFiles.lua был объединён в
@@ -11,6 +14,16 @@ local modulePath = (arg and arg[1])
                 or (os.getenv and os.getenv("LISTFILES_MODULE"))
                 or "paths.lua"
 local M = dofile(modulePath)
+
+-- ------------------------------------------------------------
+--  Определение платформы. Модуль paths.lua работает только на
+--  Windows (cmd.exe + UNC-пути), поэтому вне Windows FS-тесты
+--  пропускаются graceful-ly — как в test_paths.lua (skip при
+--  отсутствии TEMP/TMP).
+-- ------------------------------------------------------------
+local IS_WINDOWS = package.config:sub(1, 1) == "\\"
+local HAS_TEMP   = (os.getenv("TEMP") or os.getenv("TMP")) ~= nil
+local FS_READY   = IS_WINDOWS and HAS_TEMP
 
 -- ------------------------------------------------------------
 --  Доступ к внутренним хелперам.
@@ -154,9 +167,15 @@ local function setup()
     touch(BASE .. "\\nested\\n2\\n2a.txt")
 end
 
-local function teardown() rmdir(BASE) end
+local function teardown() if FS_READY then rmdir(BASE) end end
 
-setup()
+if FS_READY then
+    setup()
+else
+    print("NOTE: не-Windows (или TEMP/TMP не задан) — файловые фикстуры")
+    print("      не создаются; группы dirExists/listFiles/listDirs/")
+    print("      listFilesRecursive/integration/_test helpers будут пропущены.")
+end
 
 -- ------------------------------------------------------------
 --  ГРУППА 1: normalizePath (12)
@@ -219,29 +238,32 @@ test("22 non-string name raises",
 -- ------------------------------------------------------------
 local utf16 = _T.utf16leToUtf8
 group("utf16leToUtf8")
-test_or_skip(utf16 ~= nil, "23 empty input",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "23 empty input",
     function() eq(utf16(""), "") end)
-test_or_skip(utf16 ~= nil, "24 ASCII",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "24 ASCII",
     function() eq(utf16(u16char(0x48) .. u16char(0x69)), "Hi") end)
-test_or_skip(utf16 ~= nil, "25 odd trailing byte dropped",
+-- На не-Windows вывод cmd.exe (/u) недоступен, а поведение с
+-- нечётным байтом зависит от кодовой страницы — пропускаем вне Windows.
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "25 odd trailing byte dropped",
     function() eq(utf16("\x41"), "") end)
-test_or_skip(utf16 ~= nil, "26 Cyrillic U+0410",
+-- См. комментарий к тесту 25: требует cmd-пайплайна Windows.
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "26 Cyrillic U+0410",
     function() eq(utf16(u16char(0x0410)), "\xD0\x90") end)
-test_or_skip(utf16 ~= nil, "27 Cyrillic word",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "27 Cyrillic word",
     function() eq(utf16(u16char(0x041F) .. u16char(0x0440) .. u16char(0x0438)),
                   "\xD0\x9F\xD1\x80\xD0\xB8") end)
-test_or_skip(utf16 ~= nil, "28 emoji U+1F600",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "28 emoji U+1F600",
     function() eq(utf16(u16char(0x1F600)), "\xF0\x9F\x98\x80") end)
-test_or_skip(utf16 ~= nil, "29 U+FFFD",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "29 U+FFFD",
     function() eq(utf16(u16char(0xFFFD)), "\xEF\xBF\xBD") end)
-test_or_skip(utf16 ~= nil, "30 lone high surrogate → U+FFFD",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "30 lone high surrogate → U+FFFD",
     function() eq(utf16("\x00\xD8"), "\xEF\xBF\xBD") end)
-test_or_skip(utf16 ~= nil, "31 lone low surrogate → U+FFFD",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "31 lone low surrogate → U+FFFD",
     function() eq(utf16("\x00\xDC"), "\xEF\xBF\xBD") end)
-test_or_skip(utf16 ~= nil, "32 mixed ASCII+Cyrillic",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "32 mixed ASCII+Cyrillic",
     function() eq(utf16(u16char(0x41) .. u16char(0x0410) .. u16char(0x42)),
                   "A\xD0\x90B") end)
-test_or_skip(utf16 ~= nil, "33 U+FEFF preserved",
+test_or_skip(utf16 ~= nil and IS_WINDOWS, "33 U+FEFF preserved",
     function() eq(utf16(u16char(0xFEFF)), "\xEF\xBB\xBF") end)
 
 -- ------------------------------------------------------------
@@ -277,43 +299,43 @@ end)
 --  ГРУППА 5: dirExists (8)
 -- ------------------------------------------------------------
 group("dirExists")
-test("38 existing dir → true",
+test_or_skip(FS_READY, "38 existing dir → true",
     function() is_true(M.dirExists(BASE .. "\\empty")) end)
-test("39 non-existent → false",
+test_or_skip(FS_READY, "39 non-existent → false",
     function() is_false(M.dirExists(BASE .. "\\nonexistent_zzz")) end)
-test("40 file → false",
+test_or_skip(FS_READY, "40 file → false",
     function() is_false(M.dirExists(BASE .. "\\files_only\\a.txt")) end)
-test("41 trailing backslash",
+test_or_skip(FS_READY, "41 trailing backslash",
     function() is_true(M.dirExists(BASE .. "\\empty\\")) end)
-test("42 forward slashes",
+test_or_skip(FS_READY, "42 forward slashes",
     function() is_true(M.dirExists(BASE:gsub("\\", "/") .. "/empty")) end)
-test("43 C:\\ exists",
+test_or_skip(FS_READY, "43 C:\\ exists",
     function() is_true(M.dirExists("C:\\")) end)
-test("44 dir with space",
+test_or_skip(FS_READY, "44 dir with space",
     function() is_true(M.dirExists(BASE .. "\\dirs_only\\sub with space")) end)
-test("45 relative '.' resolves",
+test_or_skip(FS_READY, "45 relative '.' resolves",
     function() is_true(M.dirExists(".")) end)
 
 -- ------------------------------------------------------------
 --  ГРУППА 6: listFiles (7)
 -- ------------------------------------------------------------
 group("listFiles")
-test("46 empty dir → {}",
+test_or_skip(FS_READY, "46 empty dir → {}",
     function() eq(#M.listFiles(BASE .. "\\empty"), 0) end)
-test("47 non-existent → {}",
+test_or_skip(FS_READY, "47 non-existent → {}",
     function() eq(#M.listFiles(BASE .. "\\nonexistent_zzz"), 0) end)
-test("48 all 7 files listed", function()
+test_or_skip(FS_READY, "48 all 7 files listed", function()
     set_eq(M.listFiles(BASE .. "\\files_only"),
         {"a.txt", "b.txt", "UPPER.TXT", "with space.txt",
          "%TEMP%.txt", "excl!am.txt", "amp&ersand.txt"})
 end)
-test("49 dirs_only has no files",
+test_or_skip(FS_READY, "49 dirs_only has no files",
     function() eq(#M.listFiles(BASE .. "\\dirs_only"), 0) end)
-test("50 mixed: only files",
+test_or_skip(FS_READY, "50 mixed: only files",
     function() set_eq(M.listFiles(BASE .. "\\mixed"), {"m1.txt"}) end)
-test("51 spaces preserved",
+test_or_skip(FS_READY, "51 spaces preserved",
     function() contains(M.listFiles(BASE .. "\\files_only"), "with space.txt") end)
-test("52 % ! & preserved", function()
+test_or_skip(FS_READY, "52 % ! & preserved", function()
     local r = M.listFiles(BASE .. "\\files_only")
     contains(r, "%TEMP%.txt")
     contains(r, "excl!am.txt")
@@ -324,67 +346,67 @@ end)
 --  ГРУППА 7: listDirs (5)
 -- ------------------------------------------------------------
 group("listDirs")
-test("53 empty dir → {}",
+test_or_skip(FS_READY, "53 empty dir → {}",
     function() eq(#M.listDirs(BASE .. "\\empty"), 0) end)
-test("54 dirs_only all subdirs", function()
+test_or_skip(FS_READY, "54 dirs_only all subdirs", function()
     set_eq(M.listDirs(BASE .. "\\dirs_only"),
         {"sub1", "sub2", "sub with space"})
 end)
-test("55 files_only → no dirs",
+test_or_skip(FS_READY, "55 files_only → no dirs",
     function() eq(#M.listDirs(BASE .. "\\files_only"), 0) end)
-test("56 mixed: only dirs", function()
+test_or_skip(FS_READY, "56 mixed: only dirs", function()
     set_eq(M.listDirs(BASE .. "\\mixed"), {"md1", "md2"})
 end)
-test("57 nested top-level",
+test_or_skip(FS_READY, "57 nested top-level",
     function() set_eq(M.listDirs(BASE .. "\\nested"), {"n1", "n2"}) end)
 
 -- ------------------------------------------------------------
 --  ГРУППА 8: listFilesRecursive (5)
 -- ------------------------------------------------------------
 group("listFilesRecursive")
-test("58 flat dir count matches",
+test_or_skip(FS_READY, "58 flat dir count matches",
     function() eq(#M.listFilesRecursive(BASE .. "\\files_only"), 7) end)
-test("59 nested dir — 4 files",
+test_or_skip(FS_READY, "59 nested dir — 4 files",
     function() eq(#M.listFilesRecursive(BASE .. "\\nested"), 4) end)
-test("60 full paths", function()
+test_or_skip(FS_READY, "60 full paths", function()
     for _, p in ipairs(M.listFilesRecursive(BASE .. "\\nested")) do
         is_true(p:sub(1, #BASE) == BASE, "not full path: " .. p)
     end
 end)
-test("61 deep file present", function()
+test_or_skip(FS_READY, "61 deep file present", function()
     for _, p in ipairs(M.listFilesRecursive(BASE .. "\\nested")) do
         if p:find("deep1.txt", 1, true) then return end
     end
     error("deep1.txt not found")
 end)
-test("62 empty dir → {}",
+test_or_skip(FS_READY, "62 empty dir → {}",
     function() eq(#M.listFilesRecursive(BASE .. "\\empty"), 0) end)
 
 -- ------------------------------------------------------------
 --  ГРУППА 9: интеграция (5)
 -- ------------------------------------------------------------
 group("integration")
-test("63 every listDirs entry resolves", function()
+test_or_skip(FS_READY, "63 every listDirs entry resolves", function()
     for _, name in ipairs(M.listDirs(BASE .. "\\mixed")) do
         is_true(M.dirExists(M.joinPath(BASE .. "\\mixed", name)),
                 "dirExists false for " .. name)
     end
 end)
-test("64 every listFiles entry is NOT a dir", function()
+test_or_skip(FS_READY, "64 every listFiles entry is NOT a dir", function()
     for _, name in ipairs(M.listFiles(BASE .. "\\mixed")) do
         is_false(M.dirExists(M.joinPath(BASE .. "\\mixed", name)),
                  "dirExists true for file " .. name)
     end
 end)
-test("65 listFiles then dirExists parent", function()
+test_or_skip(FS_READY, "65 listFiles then dirExists parent", function()
     local _ = M.listFiles(BASE .. "\\files_only")
     is_true(M.dirExists(BASE .. "\\files_only"))
 end)
-test("66 resetCwdCache no break", function()
+test_or_skip(FS_READY, "66 resetCwdCache no break", function()
     M.resetCwdCache()
     is_true(M.dirExists(BASE .. "\\empty"))
 end)
-test("67 idempotent count", function()
+test_or_skip(FS_READY, "67 idempotent count", function()
     local a = M.listFiles(BASE .. "\\files_only")
     local b = M.listFiles(BASE .. "\\files_only")
     eq(#a, #b, "listFiles inconsistent")
@@ -394,7 +416,7 @@ end)
 --  ГРУППА 10: _test helpers (3)
 -- ------------------------------------------------------------
 group("_test helpers")
-test_or_skip(_T.makeTempPair ~= nil, "68 makeTempPair", function()
+test_or_skip(FS_READY and _T.makeTempPair ~= nil, "68 makeTempPair", function()
     local pf, bf = _T.makeTempPair("C:\\test", "echo hi")
     is_true(pf ~= nil, "pathFile nil")
     is_true(bf ~= nil, "batFile nil")
@@ -406,7 +428,7 @@ test_or_skip(_T.makeTempPair ~= nil, "68 makeTempPair", function()
     if pf then for _ = 1, 20 do if os.remove(pf) then break end end end
     if bf then for _ = 1, 20 do if os.remove(bf) then break end end end
 end)
-test_or_skip(_T.runBat ~= nil, "69 runBat strips __LF_OK__", function()
+test_or_skip(FS_READY and _T.runBat ~= nil, "69 runBat strips __LF_OK__", function()
     local out = _T.runBat("C:\\", "echo ok")
     is_true(out ~= nil, "runBat returned nil")
     if out then

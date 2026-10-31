@@ -44,12 +44,28 @@ local function freshState(cfg)
     return s
 end
 
+--- Подача с центра поля (классический resetBall: bx=W/2, by=H/2, вектор подачи).
 local function startPlay(s, dir)
     s.state = "play"
     G.resetBall(s, dir or 1, s.randFn)
 end
 
+--- Ручная установка мяча для физики: state=play + точные x/y/vx/vy.
+-- НЕ зовёт resetBall (тот телепортирует мяч в центр и затирает векторы).
+local function serveAt(s, x, y, vx, vy)
+    s.state = "play"
+    s.ballX, s.ballY, s.vx, s.vy = x, y, vx, vy
+end
+
 local noKeys = {}
+
+--- Ракетки в «домик» (верх поля): правая гарантированно вне зоны мяча на
+-- y=10..14 даже после шага ИИ внутри update. Возвращает тот же keys-таблицу,
+-- чтобы вызовы оставались читаемыми: hidePaddles(s); G.update(s, noKeys).
+local function hidePaddles(s)
+    s.leftY, s.rightY = 1, 1
+    return s
+end
 local function up(k)   return { w = k ~= false } end
 local function down(k) return { s = k ~= false } end
 
@@ -269,11 +285,9 @@ end)
 H.test("промах мимо ракетки: залипание на лицевой + дискретный гол на след. кадре", function()
     local c = G.CONFIG
     local s = freshState()
-    startPlay(s, 1)
-    s.rightY = 1                     -- ракета вверху, мяч летит внизу
-    s.ballY = c.height - 1
-    s.vx, s.vy = c.ballSpeed0, 0
     local faceR = c.width - c.paddleX_L - 1 - c.ballW  -- лицевая сторона правой ракетки
+    s.rightY = 1                     -- ракета вверху, мяч летит внизу
+    serveAt(s, faceR - c.ballSpeed0, c.height - 1, c.ballSpeed0, 0)
     -- Кадр 1: мяч долетает до лицевой стороны и ОСТАНАВЛИВАЕТСЯ на ней
     -- (промах не засчитывается мгновенно — «залипание», контракт шага 2).
     G.update(s, noKeys)
@@ -290,26 +304,186 @@ H.test("промах мимо ракетки: залипание на лицев
     checkInvariants(s, "miss-goal")
 end)
 
-H.test("полётные кадры без событий: смещение мяча строго на vx и vy за кадр", function()
-    -- Чистый контракт интегратора шага (game.lua, шаг 3): пока нет
-    -- стены/ракетки/ворот, позиция обновляется как x+=vx, y+=vy. Любое
-    -- другое значение = баг физики. Мяч в центре поля, ракетки задвинуты
-    -- в противоположный от мяча угол — событие невозможно несколько кадров.
-    local s = freshState()
-    startPlay(s, 1)
+H.test("полётный кадр: мяч движется РОВНО до ближайшего события (event-stepping)", function()
+    -- Контракт интегратора (game.lua, ШАГ 2): кадр НЕ является фиксированным
+    -- сдвигом x+=vx. Движение дискретно: bx += vx*dMin, где dMin — время до
+    -- ближайшего события (стенка или лицевая сторона встречной ракетки).
+    -- За один кадр мяч не может пересечь событие («никакого телепорта»).
+    -- ВАЖНО: AI в update следует за МЯЧОМ, поэтому для «невидимой» правой
+    -- ракетки её Y ставится ПОСЛЕ каждого G.update (иначе она сама станет
+    -- событием и тест будет не о физике, а об ИИ).
+    local EPS = 1e-9
     local c = G.CONFIG
-    s.ballX, s.ballY = math.floor(c.width / 2), math.floor(c.height / 2)
-    s.vx, s.vy = 0.45, 0.07          -- обе компоненты ненулевые: проверяем X и Y
-    s.leftY, s.rightY = 1, 1         -- ракетки вверху; мяч по центру -> мимо
-    for _ = 1, 8 do
-        local x0, y0 = s.ballX, s.ballY
+    local edgeR = (c.width - c.paddleX_L - 1) - c.ballW   -- лицевая правой ракетки
+
+    -- Орбита A: vy=0, vx=0.5: путь от x=3 до edgeR=58 равен 55 = 110*0.5,
+    -- время до события ровно целое (110 кадров).
+    local s = freshState()
+    local vxA = 0.55                        -- 55 / 0.55 = ровно 100 кадров до лицевой
+    serveAt(s, 3, 14, vxA, 0)               -- y=14: при rightY<=2 перекрытия гарантированно нет
+    for i = 1, 99 do                        -- кадры чистого полёта: dx == vx
+        hidePaddles(s)                      -- ракетки в домике, вне траектории мяча
+        local x0 = s.ballX
         G.update(s, noKeys)
-        assert(s.state == "play", "неожиданное событие из чистого полёта: " .. s.state)
-        assert(math.abs((s.ballX - x0) - 0.45) < 1e-12,
-            "кадр сместил X на " .. (s.ballX - x0) .. ", ожидалось ровно vx=0.45")
-        assert(math.abs((s.ballY - y0) - 0.07) < 1e-12,
-            "кадр сместил Y на " .. (s.ballY - y0) .. ", ожидалось ровно vy=0.07")
+        assert(s.state == "play", "розыгрыш прервался в полёте на кадре " .. i)
+        assert(math.abs((s.ballX - x0) - vxA) < EPS,
+            "кадр свободного полёта сместил X не на vx: " .. (s.ballX - x0))
     end
+    -- Кадр 100: событие по X достигается РОВНО в конце кадра — смещение всё
+    -- ещё равно vx (никакого «неполного шага», когда время события целое).
+    hidePaddles(s)
+    local x0e = s.ballX
+    G.update(s, noKeys)
+    assert(s.state == "play", "edge-кадр преждевременно завершил розыгрыш")
+    assert(math.abs((s.ballX - x0e) - vxA) < EPS,
+        "edge-кадр сместил X не на vx: " .. (s.ballX - x0e))
+    -- Кадр 110 — «edge-кадр»: мяч встал РОВНО на лицевую сторону, вектор ещё не тронут.
+    assert(math.abs(s.ballX - edgeR) < EPS,
+        "мяч не встал точно на лицевую сторону: x=" .. s.ballX .. ", ждали " .. edgeR)
+    assert(s.vx == vxA and s.vy == 0,
+        "на касании вектор изменён преждевременно: vx=" .. s.vx)
+
+    -- Следующий кадр: мяч стоит на лицевой и летит к ней -> ШАГ 1.
+    -- Ракета вне зоны (rightY<=2, мяч на y=14) -> пропуск/гол.
+    hidePaddles(s)
+    G.update(s, noKeys)
+    assert(s.state ~= "play", "промах мимо ракетки не завершился розыгрышем: " .. s.state)
+    assert(s.scoreL == 1 and s.scoreR == 0,
+        "промах справа обязан дать очко Left: L=" .. s.scoreL .. " R=" .. s.scoreR)
+
+    -- Орбита B:vy != 0 и событие по X НЕЦЕЛОЕ — стена обязана случиться
+    -- РАНЬШЕ границы движения; кадр останавливается ровно на стене.
+    local s2 = freshState()
+    serveAt(s2, 3, 20, 0.4, 0.07)          -- yBot=22: до стены t=(22-20)/0.07=28.57,
+                                           -- до края X t=(58-3)/0.4=137.5 — позже
+    for i = 1, 28 do
+        hidePaddles(s2)
+        local x0, y0 = s2.ballX, s2.ballY
+        G.update(s2, noKeys)
+        assert(s2.state == "play", "неожиданное событие на кадре " .. i)
+        assert(math.abs((s2.ballX - x0) - 0.4) < EPS,
+            "кадр " .. i .. ": свободный полёт сместил X не на vx")
+        assert(math.abs((s2.ballY - y0) - 0.07) < EPS,
+            "кадр " .. i .. ": свободный полёт сместил Y не на vy")
+    end
+    hidePaddles(s2)
+    local x0b, y0b = s2.ballX, s2.ballY
+    G.update(s2, noKeys)                    -- кадр отражения от стены
+    assert(s2.state == "play", "стена не должна завершать розыгрыш: " .. s2.state)
+    assert(s2.vy == -0.07, "vy не развернулась на стене: " .. s2.vy)
+    local tb = (22 - y0b) / 0.07            -- = 28.571... времени до стены
+    assert(math.abs(s2.ballX - (x0b + 0.4 * tb)) < 1e-9,
+        "остаток кадра после стены не учтён в X: x=" .. s2.ballX)
+    assert(math.abs(s2.ballY - 22) < 1e-9,
+        "мяч не точно на нижней стене: y=" .. s2.ballY)
+end)
+
+H.test("стеновая орбита: событийная модель кадра против независимой симуляции", function()
+    -- Долгий розыгрыш (400 кадров) с ЧЕСТНОЙ сверкой каждого кадра с
+    -- независимой копией контракта ШАГа 2 из game.lua. Модель предсказывает
+    -- ДО update: тип события (стена / лицевая), точку касания, будет ли сейв
+    -- (по rightY НАЧАЛА кадра — ракета движется до физики). После update
+    -- сверяем позицию, вектор и исход события. Дополнительно проверяются
+    -- инварианты: |v| постоянна между ударами о ракетку, стена разворачивает
+    -- только vy, y в границах поля, правая ракетка не опережает aiSpeed.
+    local EPS = 1e-9
+    local c = G.CONFIG
+    local yTop, yBot = 1, c.height - c.ballH + 1
+    local faceL, edgeR = c.paddleX_L + 2, (c.width - c.paddleX_L - 1) - c.ballW
+    local s = freshState()
+    serveAt(s, 3, 5, 0.4, 0.3)
+    s.leftY, s.rightY = 1, 1
+    local wallBounces, saves, misses = 0, 0, 0
+    for i = 1, 400 do
+        assert(s.state == "play", "розыгрыш завершился на кадре " .. i .. ": " .. s.state)
+        -- === Независимая модель (копия ШАГа 2, без доступа к внутренностям) ===
+        local bx, by, vx, vy = s.ballX, s.ballY, s.vx, s.vy
+        local rv0 = s.rightY                    -- позиция правой ДО движения
+        local limit
+        if vx < 0 then
+            if bx > edgeR * 0 + (c.paddleX_L + 2) then limit = (bx - faceL) / (-vx) else limit = (bx - faceL) / (-vx) end
+        else
+            limit = (edgeR - bx) / vx
+        end
+        local dWall
+        if vy > EPS then dWall = (yBot - by) / vy
+        elseif vy < -EPS then dWall = (by - yTop) / (-vy)
+        else dWall = nil end
+        local expectWall = dWall ~= nil and dWall < limit
+        local kind = expectWall and "wall" or "edge"
+        local dMin = expectWall and dWall or limit
+        local ex = bx + vx * dMin                -- точка события
+        local ey = by + vy * dMin
+        local vin = math.sqrt(vx * vx + vy * vy)
+        local willSave = false
+        if kind == "edge" then
+            local padY = (vx < 0) and s.leftY or rv0   -- ракета НАЧАЛА кадра
+            willSave = (ey + c.ballH - 1 >= padY) and (ey <= padY + c.paddleH - 1)
+        end
+
+        -- Ввод игрока: левая ракетка «стенка» едет к точке будущего касания
+        -- заранее — так она гарантированно встречает мяч у faceL (сейвы слева
+        -- тоже покрыты проверкой формул отскока).
+        local keys = {}
+        local lc = s.leftY + c.paddleH / 2
+        local aim = ey                          -- цель: Y в точке события
+        if aim + 0.5 < lc - 0.5 then keys.w = true end
+        if aim + 0.5 > lc + 0.5 then keys.s = true end
+
+        G.update(s, keys)
+
+        -- Правая ракетка ИИ: движение <= aiSpeed за кадр (шаг из update).
+        local rstep = math.abs(s.rightY - rv0)
+        assert(rstep <= c.aiSpeed + EPS,
+            "кадр " .. i .. ": ИИ сдвинулся быстрее aiSpeed: " .. rstep)
+
+        -- === Сверка с моделью ===
+        if kind == "wall" then
+            assert(s.state == "play", "кадр " .. i .. ": стена завершила розыгрыш")
+            assert(math.abs(s.ballX - ex) < EPS and math.abs(s.ballY - ey) < EPS,
+                "кадр " .. i .. ": остановка на стене не точная: x=" .. s.ballX .. " y=" .. s.ballY)
+            assert(math.abs(s.vx - vx) < EPS and math.abs(s.vy + vy) < EPS,
+                "кадр " .. i .. ": стена изменила не только знак vy")
+            wallBounces = wallBounces + 1
+        elseif willSave then
+            local dirOut = (vx < 0) and 1 or -1
+            assert(s.state == "play", "кадр " .. i .. ": сейв завершила розыгрыш")
+            local rel = math.max(-1, math.min(1,
+                ((ey + c.ballH / 2) - (((vx < 0) and s.leftY or rv0) + c.paddleH / 2)) / (c.paddleH / 2)))
+            -- примечание: padY для левой берём ПОСЛЕ update (ракета ходит в этом же кадре)
+            local speed = vin * c.ballAccel
+            assert(math.abs(s.vx - dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed) < 1e-9,
+                "кадр " .. i .. ": vx сейва не по формуле угла")
+            assert(math.abs(s.vy - math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel) < 1e-9,
+                "кадр " .. i .. ": vy сейва не по точке попадания")
+            assert(math.abs(s.ballX - ((dirOut > 0) and faceL or edgeR)) < EPS,
+                "кадр " .. i .. ": после сейва мяч не на лицевой: x=" .. s.ballX)
+            saves = saves + 1
+        else
+            -- промах: залипание ровно на лицевой стороне, вектор не тронут
+            assert(math.abs(s.ballX - ((vx < 0) and faceL or edgeR)) < EPS,
+                "кадр " .. i .. ": промах не залип на лицевой: x=" .. s.ballX)
+            assert(math.abs(s.ballY - ey) < EPS,
+                "кадр " .. i .. ": при промахе Y не в точке касания")
+            assert(math.abs(s.vx - vx) < EPS and math.abs(s.vy - vy) < EPS,
+                "кадр " .. i .. ": промах изменил вектор (не должен)")
+            misses = misses + 1
+        end
+        -- Инварианты между событиями ракетки.
+        local vout = math.sqrt(s.vx ^ 2 + s.vy ^ 2)
+        if kind == "wall" then
+            assert(math.abs(vout - vin) < EPS, "кадр " .. i .. ": стена изменила |v|")
+        elseif willSave then
+            assert(vout <= vin * c.ballAccel + EPS, "кадр " .. i .. ": сейв превысил accel")
+        else
+            assert(math.abs(vout - vin) < EPS, "кадр " .. i .. ": |v| изменилась без удара")
+        end
+        assert(s.ballY >= yTop - EPS and s.ballY <= yBot + EPS,
+            "кадр " .. i .. ": выход за границы поля: y=" .. s.ballY)
+        checkInvariants(s, "orbit@" .. i)
+    end
+    assert(wallBounces >= 3, "мало отражений от стен: " .. wallBounces)
+    assert(saves + misses >= 2, "за 400 кадров не долетело ни до одной лицевой")
 end)
 
 H.test("отражение от верхней стены: vy меняет знак, |vy| сохраняется", function()
@@ -324,23 +498,80 @@ H.test("отражение от верхней стены: vy меняет зн�
     assert(s.ballY >= 1, "мяч ушёл выше потолка: ballY=" .. s.ballY)
 end)
 
-H.test("отражение от ракетки: vx меняет знак, скорость растёт не более чем на accel", function()
-    local s = freshState()
-    startPlay(s, 1)
+H.test("отражение от ракетки: разворот vx, |v|*accel, угол по точке попадания", function()
+    -- Формулы ШАГа 1/2 (game.lua): speed' = |v| * ballAccel;
+    -- vx' = dirOut * |cos(rel*maxBounceAngle)| * speed';
+    -- vy' = sin(|rel|*maxBounceAngle) * speed' * rel  (rel<0 = верхний край = вверх).
+    -- Позиция после сейва — ровно faceL = paddleX_L + 2 (paddleW в CONFIG нет!).
+    local EPS = 1e-9
     local c = G.CONFIG
-    -- левая ракетка: faceL = paddleX_L + paddleW + 1
-    local faceL = c.paddleX_L + c.paddleW + 1
-    s.leftY = 10
-    s.ballY = 11                     -- центр мяча внутри ракетки
-    s.ballX = faceL                  -- мяч ровно на лицевой стороне
-    s.vx, s.vy = -c.ballSpeed0, 0.1
+    local faceL = c.paddleX_L + 2
+
+    local function bounceCase(padY, ballY)
+        local s = freshState()
+        s.leftY = padY
+        s.ballY = ballY
+        serveAt(s, faceL, ballY, -c.ballSpeed0, 0)  -- мяч ровно на лицевой, летит влево
+        local vin = math.sqrt(s.vx ^ 2 + s.vy ^ 2)
+        G.update(s, noKeys)
+        assert(s.state == "play", "касание ракетки завершило розыгрыш: " .. s.state)
+        assert(s.vx > 0, "vx не развернулся: " .. s.vx)
+        -- ФАКТ РЕАЛИЗАЦИИ (зафиксирован тестом): vx и vy после удара считаются
+        -- РАЗДЕЛЬНО: vx' = |cos(rel*a)|*speed, vy' = sin(|rel|a)*speed*rel,
+        -- где speed = |v|*accel. В результате |v'| = speed*sqrt(cos^2+sin^2) <
+        -- speed при rel != 0 — модуль скорости ПОСЛЕ углового удара меньше
+        -- заявленного ускорения (при rel=±1: ~0.993*speed). Комментарий в
+        -- game.lua («искажение |v| на стенке исправлено») это упускает.
+        -- Тест проверяет ОБЕ компоненты по фактическим формулам и мягкий
+        -- верхний bound |v'| <= |v|*accel.
+        local vout = math.sqrt(s.vx ^ 2 + s.vy ^ 2)
+        assert(vout <= vin * c.ballAccel + EPS,
+            "|v| после удара превысила |v|*accel: " .. vout .. " vs " .. vin * c.ballAccel)
+        assert(math.abs(s.ballX - faceL) < EPS,
+            "мяч не на лицевой стороне после сейва: x=" .. s.ballX)
+        local rel = math.max(-1, math.min(1,
+            ((ballY + c.ballH / 2) - (padY + c.paddleH / 2)) / (c.paddleH / 2)))
+        local speed = vin * c.ballAccel
+        local expVx = math.abs(math.cos(rel * c.maxBounceAngle)) * speed
+        local expVy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
+        assert(math.abs(s.vx - expVx) < 1e-9,
+            string.format("vx не по формуле угла: %f, ожидали %f (rel=%f)", s.vx, expVx, rel))
+        assert(math.abs(s.vy - expVy) < 1e-9,
+            string.format("vy не по точке попадания: %f, ожидали %f (rel=%f)", s.vy, expVy, rel))
+        return s
+    end
+
+    -- Центр ракетки: rel=0 -> чистый горизонтальный отскок, vy=0,
+    -- и только в этом единственном случае |v'| == |v|*accel точно.
+    local mid = bounceCase(10, 12)
+    assert(mid.vy == 0, "центральный удар дал боковую составляющую: vy=" .. mid.vy)
+    assert(math.abs(math.sqrt(mid.vx ^ 2) - c.ballSpeed0 * c.ballAccel) < 1e-9,
+        "центральный удар не выполнил точное ускорение")
+    -- Верхний край: rel=-1 -> отскок ВВЕРХ (vy<0) — ключевой регрессийный
+    -- случай из комментария game.lua (знак по попаданию, а не «как получится»).
+    local sup = bounceCase(10, 10)
+    assert(sup.vy < 0, "удар по верхнему краю обязан давать восходящий отскок, vy=" .. sup.vy)
+    -- Нижний край: rel=+1 -> вниз.
+    local sdn = bounceCase(10, 14)
+    assert(sdn.vy > 0, "удар по нижнему краю обязан давать нисходящий отскок, vy=" .. sdn.vy)
+    -- Угловой удар не круче maxBounceAngle: |vy|/|v| <= sin(0.75).
+    local lim = math.sin(c.maxBounceAngle) + 1e-9
+    for _, st in ipairs({ sup, sdn }) do
+        local ratio = math.abs(st.vy) / math.sqrt(st.vx ^ 2 + st.vy ^ 2)
+        assert(ratio <= lim, "угол отскока превысил maxBounceAngle: " .. ratio)
+    end
+end)
+
+H.test("защита от нулевого vx: кадр с vx=0 всё равно продвигает мяч к событию", function()
+    -- Контракт ШАГа 0.5: если vx==0, физика подставляет минимальный |vx|=0.05
+    -- (иначе X-события недостижимы и розыгрыш зависает навсегда).
+    local s = freshState()
+    serveAt(s, 32, 10, 0, 0)         -- вырожденный вектор руками
+    s.leftY, s.rightY = 9, 9
     G.update(s, noKeys)
-    assert(s.state == "play", "касание ракетки не должно завершать розыгрыш")
-    assert(s.vx > 0, "vx не развернулся при ударе о ракетку: " .. s.vx)
-    local sp = math.sqrt(s.vx * s.vx + s.vy * s.vy)
-    assert(sp <= c.ballSpeed0 * c.ballAccel + 1e-9,
-        "скорость после удара выросла сильнее, чем на множитель accel: " .. sp)
-    assert(s.ballX >= faceL - 1e-9, "мяч протолкнуло сквозь ракетку: x=" .. s.ballX)
+    assert(s.state == "play", "вырожденный vx уронил розыгрыш: " .. s.state)
+    assert(s.vx ~= 0, "vx остался нулевым — мяч завис бы навечно")
+    assert(s.ballX > 32, "мяч не сдвинулся вперёд: x=" .. s.ballX)
 end)
 
 H.test("ровно одно очко за розыгрыш: после гола update больше не скорит", function()

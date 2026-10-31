@@ -126,7 +126,9 @@ function M.update(s, keys)
     local faceL = lx + 2                            -- лицевая сторона левой ракетки
     local faceR = rx - c.ballW                      -- лицевая сторона правой ракетки
     local edgeL, edgeR = faceL, faceR               -- линии касания лицевых сторон
-    local goalL, goalR = -c.ballW, c.width  -- линии полного пропуска (гол)
+    local goalL, goalR = -c.ballW, c.width + 1  -- линии полного пропуска (гол):
+      -- слева bx <= -ballW (мяч целиком за левым краем), справа bx >= width+1
+      -- (правый край мяча за последней клеткой поля)
 
     local bx, by = s.ballX, s.ballY
     local vx, vy = s.vx, s.vy
@@ -182,7 +184,7 @@ function M.update(s, keys)
             -- Знак vy задаётся точкой попадания (выше центра ракетки — вверх),
             -- а не знаком rel: на левой ракетке rel=-1 соответствует ВЕРХНЕМУ
             -- краю (меньший Y) и обязан давать восходящий отскок (vy<0).
-            vy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
+            vy = math.sin(rel * c.maxBounceAngle) * speed
             bx = (dirOut > 0) and faceL or faceR
         else
             -- Ракета успели уйти — пропуск состоялся.
@@ -278,7 +280,7 @@ function M.update(s, keys)
             vx = dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed
             -- Знак vy — по точке попадания (см. шаг 1): выше центра ракетки
             -- (rel<0, меньший Y) -> мяч уходит вверх (vy<0).
-            vy = math.sin(math.abs(rel) * c.maxBounceAngle) * speed * rel
+            vy = math.sin(rel * c.maxBounceAngle) * speed
             bx = (dirOut > 0) and faceL or faceR
         end
         -- Промах: мяч остаётся ровно на лицевой стороне ракетки; дальше

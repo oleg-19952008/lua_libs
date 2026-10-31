@@ -131,9 +131,14 @@ local M = {}
 --  1. Разбор путей (чистые функции, без доступа к ФС)
 -- ============================================================
 
-local function normalizePath(path)
+-- normalizePath(path, trimTrailingSlash)
+--   trimTrailingSlash == nil/true  -> хвостовой "\" снимается (по умолчанию).
+--   trimTrailingSlash == false     -> хвостовой "\" сохраняется — режим
+--     обратной совместимости со старым listFiles.lua (см. M.pathCombine).
+local function normalizePath(path, trimTrailingSlash)
     assert(type(path) == "string", "normalizePath: path must be a string")
     assert(path ~= "",                "normalizePath: path must not be empty")
+    if trimTrailingSlash == nil then trimTrailingSlash = true end
 
     path = path:gsub("%/", "\\")
 
@@ -150,6 +155,7 @@ local function normalizePath(path)
 
     local trimmed = path:gsub("\\+$", "")
     if trimmed == "" then return path end
+    if not trimTrailingSlash then return path end
     return trimmed
 end
 
@@ -724,12 +730,16 @@ end
 --      выигрывает и возвращается как нормализованный. Это
 --      соглашение .NET Path.Combine и Python os.path.join;
 --      снимает сюрприз «C:\foo\C:\x».
---    * Изменение контракта относительно старого listFiles.joinPath:
---      joinPath(dir, "") теперь возвращает normalizePath(dir)
---      (раньше — dir .. "\"), joinPath(dir, nil) больше не падает
---      (раньше — assert). Сделано ради совместимости с pathCombine.
---      Тесты должны учитывать (см. M._test).
-local function joinPath(a, b)
+--    * Расторжка со старым listFiles.joinPath решена так:
+--      joinPath — новый контракт paths.lua (dir + "" == dir);
+--      pathCombine — обратная совместимость со старым listFiles
+--      (dir + "" == dir .. "\"; хвостовой слэш у dir сохраняется).
+--      joinPath(dir, nil) больше не падает (раньше — assert).
+-- joinPath(a, b, preserveTrailing)
+--   preserveTrailing == true -> режим старого listFiles.joinPath:
+--     хвостовой разделитель у a сохраняется, пустой b даёт «dir\».
+--   По умолчанию (nil/false) — контракт paths.lua: «dir + ""» == «dir».
+local function joinPath(a, b, preserveTrailing)
     local hasA = a ~= nil and a ~= ""
     local hasB = b ~= nil and b ~= ""
     if hasA and type(a) ~= "string" then
@@ -740,13 +750,20 @@ local function joinPath(a, b)
     end
     if not hasA and not hasB then return "" end
     if not hasA then return normalizePath(b) end
-    if not hasB then return normalizePath(a) end
+    if not hasB then
+        if preserveTrailing then
+            local p = normalizePath(a)
+            if p:sub(-1) ~= "\\" and not p:match("^%a:$") then p = p .. "\\" end
+            return p
+        end
+        return normalizePath(a)
+    end
 
     if isAbsolutePath(b) then
         return normalizePath(b)
     end
 
-    local p = normalizePath(a)
+    local p = normalizePath(a, not preserveTrailing)
     local q = b:gsub("%/", "\\")
     if p:sub(-1) == "\\" then
         return p .. q
@@ -774,7 +791,10 @@ M.getExtension      = getExtension
 M.getDirName        = getDirName
 
 M.joinPath          = joinPath
-M.pathCombine       = joinPath   -- алиас (обратная совместимость)
+-- pathCombine — режим обратной совместимости со старым listFiles.lua:
+-- хвостовой разделитель сохраняется, пустой второй аргумент даёт
+-- «dir\» (у joinPath — «dir»). Поведение для остальных входов совпадает.
+M.pathCombine       = function(a, b) return joinPath(a, b, true) end
 
 M.getCwd            = processCwd -- кэш; resetCwdCache сбрасывает
 M.resetCwdCache     = resetCwdCache

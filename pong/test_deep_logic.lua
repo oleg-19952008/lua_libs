@@ -169,7 +169,12 @@ H.test("C1. full match evolution: frozen round, serve alternation, terminal inva
         if s.state == "play" then
             game.update(s, {})
         elseif s.state == "round" then
-            table.insert(goals, { scoreL = s.scoreL, scoreR = s.scoreR, msg = s.msg })
+            -- Дедуп по входу в раунд: popGoal возвращает запись ровно один
+            -- раз на каждый гол (состояние "round" длится несколько кадров).
+            local g = game.popGoal(s)
+            if g then
+                table.insert(goals, g)
+            end
             local bx, by, bl, br = s.ballX, s.ballY, s.scoreL, s.scoreR
             game.handleRound(s, now())
             if s.state == "round" then   -- пауза ещё не истекла

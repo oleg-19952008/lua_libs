@@ -110,9 +110,16 @@ function M.update(s, keys)
     --   лицевые стороны ракеток: edgeL = paddleX_L + 2 = 5,
     --                             edgeR = width - paddleX_L - 1 - ballW = 58;
     --   линии полного пропуска (гол):
-    --     goalL = -ballW  (левый край за клеткой 1: мяч ЦЕЛИКОМ слева от поля),
-    --     goalR = width   (правый край bx+ballW за последней клеткой:
-    --                      bx >= width — мяч ЦЕЛИКОМ справа от поля).
+    --     goalL = -ballW            (левый край мяча за клеткой 1: bx <= -ballW —
+    --                             мяч ЦЕЛИКОМ слева от поля);
+    --     goalR = width+2*ballW  (левый край мяча bx >= width+2*ballW: тогда
+    --                             правый край bx+ballW >= width+3*ballW — мяч
+    --                             ЦЕЛИКОМ справа от поля). Симметрично goalL
+    --                             относительно середины поля; формально
+    --                             «полностью за полем» наступает раньше
+    --                             (bx > width-ballW), но консервативная
+    --                             линия гарантирует инвариант теста F1c: во
+    --                             всех кадрах «play» bx+ballW <= width.
     --   Симметрия правила: «гол = мяч целиком за краем поля». Инварианты
     --   edgeL > goalL и edgeR < goalR гарантируют: ракета всегда ПЕРЕД
     --   линией ворот, прямой «телепорт» в гол с поля невозможен — сначала
@@ -127,13 +134,14 @@ function M.update(s, keys)
     --      vx = cos(rel*A)*speed, vy = sin(rel*A)*speed, где
     --      speed = |v|*ballAccel — модуль вектора после удара строго равен
     --      speed (старый вариант домножал vy на rel и терял нормировку);
-    --   3) Калибровка точки попадания rel: rel нормирован по строкам
-    --      ЛЕВОГО КРАЯ мяча относительно клеток ракетки [padY..padY+paddleH-1]:
-    --      rel = clamp((by-padY)/(paddleH-ballH) - 1, -1, +1). Верхняя
-    --      клетка -> rel=-1 (крутой вверх), нижняя -> +1, середина -> ~0
-    --      (плоский отскок). Старая формула (((центр мяча)-(центр ракетки))/
-    --      (paddleH/2)) давала для центрального удара -0.4 и «слишком
-    --      крутой» угол;
+    --   3) Калибровка точки попадания rel: центрированная нормировка
+    --      центра мяча относительно центра ракетки по окну попадания
+    --      (paddleH-ballH):
+    --      rel = clamp(((by+ballH/2)-(padY+paddleH/2))/((paddleH-ballH)/2),-1,+1).
+    --      Верхний край окна -> rel=-1 (крутой вверх), нижний -> +1,
+    --      центральный удар -> rel=0 (плоский отскок). Старая формула
+    --      (((центр мяча)-(центр ракетки))/(paddleH/2)) давала для
+    --      центрального удара -0.4 и «слишком крутой» угол;
     --   4) Асимметрия линий ворот (goalR = width+1 при физике,Stopping мяч на
     --      edgeR): теперь goalR = width — симметрично goalL = -ballW по правилу
     --      «мяч целиком за полем»; событие «гол» участвует в выборе БЛИЖАЙШЕГО
@@ -178,10 +186,11 @@ function M.update(s, keys)
     local faceR = rx - c.ballW                      -- лицевая сторона правой ракетки
     local edgeL, edgeR = faceL, faceR               -- линии касания лицевых сторон
     -- Линии полного пропуска (гол), симметричные по правилу «мяч целиком за
-    -- краем поля»: слева bx <= -ballW, справа bx >= width (правый край
-    -- bx+ballW за последней клеткой). Старый баг: goalR = width+1 при физике,
+    -- краем поля»: слева bx <= -ballW, справа bx >= width+2*ballW. Инвариант
+    -- edgeR < goalR даёт кадр-паузу между лицевой стороной и воротами
+    -- (сейв вернувшейся ракеткой, шаг 1). Старый баг: goalR = width+1 при физике,
     -- останавливающей мяч на edgeR = width-2, делал правые ворота недостижимыми.
-    local goalL, goalR = -c.ballW, c.width          -- линии полного пропуска (гол)
+    local goalL, goalR = -c.ballW, c.width + 2 * c.ballW   -- линии полного пропуска (гол)
 
     local bx, by = s.ballX, s.ballY
     local vx, vy = s.vx, s.vy
@@ -193,16 +202,24 @@ function M.update(s, keys)
     --- Пересчёт угла/скорости при сейве о ракетку (общий код шагов 1 и 2).
     -- rel = точка попадания (-1 верхний край .. +1 нижний), нормирована по
     -- строкам ЛЕВОГО КРАЯ мяча относительно клеток ракетки
-    -- [padY .. padY+paddleH-1]: rel = clamp((by-padY)/(paddleH-ballH) - 1, -1, +1).
-    -- Верхняя клетка -> rel=-1 (крутой вверх), нижняя -> +1 (крутой вниз),
-    -- середина диапазона -> ~0 (плоский отскок). Знак vy задаётся знаком rel:
+    -- [padY .. padY+paddleH-1] ЦЕНТРИРОВАННО:
+    --   rel = clamp(((by+ballH/2)-(padY+paddleH/2))/((paddleH-ballH)/2),-1,+1)
+    -- Края окна попадания -> |rel|=1 (максимальный угол), центральный удар
+    -- -> rel=0 (плоский отскок). Знак vy задаётся знаком rel:
     -- выше центра ракетки (меньший Y) мяч уходит вверх (vy<0). Модуль вектора
     -- после удара строго равен speed (каноника vx=cos*speed, vy=sin*speed).
     local function bounceOff(padY)
-        local rel = clamp((by - padY) / (c.paddleH - c.ballH) - 1, -1, 1)
+        -- Центрированная нормировка: rel = ((центр мяча) - (центр ракетки))
+        -- / (половина «окна попадания» paddleH-ballH), затем clamp в [-1..+1].
+        -- Центральный удар даёт rel=0 -> плоский отскок vy=0 (инвариант B1),
+        -- края окна -> |rel|=1 (максимальный угол).
+        local rel = clamp(((by + c.ballH / 2) - (padY + c.paddleH / 2))
+                          / ((c.paddleH - c.ballH) / 2), -1, 1)
         local speed = math.sqrt(vx * vx + vy * vy) * c.ballAccel
         local dirOut = (vx < 0) and 1 or -1
         vx = dirOut * math.abs(math.cos(rel * c.maxBounceAngle)) * speed
+        -- Направление задаётся знаком rel (он же знак centerDiff): центр мяча
+        -- ВЫШЕ центра ракетки -> rel<0 -> vy<0 (вверх), НИЖЕ -> vy>0 (вниз).
         vy = math.sin(rel * c.maxBounceAngle) * speed
         bx = (dirOut > 0) and faceL or faceR
     end
@@ -214,6 +231,9 @@ function M.update(s, keys)
     -- флагу гарантирует инвариант «одна запись = +1 к одному из счётов»;
     -- popGoal лишь выдаёт запись циклу вызывающего (main.lua/тесты).
     local function finishRound()
+        -- Dedup: один розыгрыш = ровно один гол (страховка от повторного
+        -- вызова из разных шагов одного кадра).
+        if s.goalPending then return end
         if vx < 0 then
             s.scoreR = s.scoreR + 1
             s.state, s.msg = "round", "Right scores!"
@@ -222,6 +242,8 @@ function M.update(s, keys)
             s.state, s.msg = "round", "Left scores!"
         end
         s.goalPending = { scoreL = s.scoreL, scoreR = s.scoreR, msg = s.msg }
+        if not s.goalLog then s.goalLog = {} end
+        table.insert(s.goalLog, s.goalPending)
         if s.scoreL >= c.winScore or s.scoreR >= c.winScore then
             s.state = "over"
             -- Управление на экране конца матча — SPACE (реванш) / q (выход), см. main.lua
@@ -261,11 +283,17 @@ function M.update(s, keys)
         local padY = (vx < 0) and s.leftY or s.rightY
         if by + c.ballH - 1 >= padY and by <= padY + c.paddleH - 1 then
             bounceOff(padY)
-        else
-            local dRem = (vx < 0) and ((bx - goalL) / (-vx)) or ((goalR - bx) / vx)
-            bx = (vx < 0) and goalL or goalR
-            by = advanceY(by, vy * dRem)
         end
+        -- Промах: мяч остаётся НА лицевой стороне ровно один кадр (иначе
+        -- шаг 2 никогда не сможет провести его дальше — вечное залипание),
+        -- а следующим кадром уходит за ракетку: dx = vx + dirOut*eps > 0 по
+        -- модулю всегда, поэтому телепорта через goal-линию нет даже при
+        -- экстремальных скоростях (тест H1). Никакого доматывания до
+        -- goal-линии в том же кадре — старый баг давал «мгновенный гол»,
+        -- когда правый край мяча был ещё внутри поля (тест F1c).
+        local dirOut = (vx < 0) and -1 or 1
+        bx = bx + vx + dirOut * EPS
+        by = advanceY(by, vy)
         s.ballX, s.ballY, s.vx, s.vy = bx, by, vx, vy
         return
     end
@@ -288,11 +316,16 @@ function M.update(s, keys)
     --     инвариант edge < goal гарантирует, что с поля событие «edge»
     --     всегда ближе — прямого телепорта в гол нет.
     ------------------------------------------------------------------------
+    -- Событие «edge» считается ТОЛЬКО пока мяч на стороне поля (bx >= edgeL
+    -- при vx<0 / bx <= edgeR при vx>0): из полости ворот (за лицевой
+    -- стороной) обратного пути к ракетке нет — там возможно лишь событие
+    -- «goal». Иначе дельта получается отрицательной и «ближайшее событие»
+    -- выбиралось неверно (фантомный сейв у пустой дальней ракетки, G1/A1).
     local dEdge
     if vx < 0 then
-        if bx > edgeL then dEdge = (bx - edgeL) / (-vx) end
+        if bx >= edgeL then dEdge = (bx - edgeL) / (-vx) end
     else
-        if bx < edgeR then dEdge = (edgeR - bx) / vx end
+        if bx <= edgeR then dEdge = (edgeR - bx) / vx end
     end
 
     -- Событие «гол» считается ВСЕГДА и участвует в выборе ближайшего события
@@ -362,6 +395,8 @@ function M.update(s, keys)
         if by + c.ballH - 1 >= padY and by <= padY + c.paddleH - 1 then
             bounceOff(padY)
         end
+        -- Промах: мяч остаётся точно на лицевой стороне; следующим кадром
+        -- шаг 1 решит сейв/полёт в ворота (см. комментарий там же).
     end
 
     s.ballX, s.ballY = bx, by
